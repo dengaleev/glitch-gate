@@ -1,7 +1,7 @@
 FROM caddy:builder AS builder
 
 RUN xcaddy build \
-    --with github.com/gamalan/caddy-tlsredis \
+    --with github.com/pberkel/caddy-storage-redis \
     --with github.com/mholt/caddy-ratelimit
 
 FROM caddy:latest
