@@ -1,22 +1,11 @@
-# (redis-storage) {
-# 	storage redis {
-# 		host 		   "redis"
-# 		port 		   6379
-# 		username       ""
-#         password       ""
-#         db             0
-# 		key_prefix     "caddy"
-# 	}
-# }
-
 {
 	storage redis {
-		host 		   "redis"
-		port 		   6379
-		username       ""
-		password       ""
-		db             0
-		key_prefix     "caddy"
+		host "redis"
+		port 6379
+		username ""
+		password ""
+		db 0
+		key_prefix "caddy"
 	}
 }
 
@@ -27,7 +16,7 @@
 			write_interval 100ms
 		}
 		zone ip_limit {
-			key    {remote_host}
+			key {remote_host}
 			events 5
 			window 1m
 		}
