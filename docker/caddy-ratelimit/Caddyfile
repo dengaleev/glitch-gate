@@ -1,0 +1,10 @@
+:8080 {
+	handle /info {
+		respond 200 {
+			body `{"ip": "{remote}"}`
+			close
+		}
+	}
+
+	respond "Hello, World!"
+}
