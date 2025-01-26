@@ -1,0 +1,34 @@
+{
+	storage redis {
+		host "redis"
+		port 6379
+		username ""
+		password ""
+		db 0
+		key_prefix "caddy"
+	}
+}
+
+:8080 {
+	rate_limit {
+		distributed {
+			read_interval 100ms
+			write_interval 100ms
+		}
+		zone ip_limit {
+			key {remote_host}
+			events 5
+			window 1m
+		}
+		log_key
+	}
+
+	handle /info {
+		respond 200 {
+			body `{"remote": "{remote}", "remote_host": "{remote_host}"}`
+			close
+		}
+	}
+
+	respond "Hello, World!"
+}
