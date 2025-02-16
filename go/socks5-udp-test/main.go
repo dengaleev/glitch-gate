@@ -50,5 +50,5 @@ func main() {
 		log.Panicf("failed to marshal response: %s", err)
 	}
 
-	log.Println(string(jsonResp))
+	log.Printf("response: %s", string(jsonResp))
 }
