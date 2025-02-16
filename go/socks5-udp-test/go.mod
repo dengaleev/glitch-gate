@@ -1,6 +1,6 @@
 module github.com/dengaleev/glitch-gate/go/socks5-udp-test
 
-go 1.23.3
+go 1.18
 
 require (
 	github.com/beevik/ntp v1.4.3
