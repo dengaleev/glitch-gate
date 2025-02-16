@@ -35,7 +35,3 @@ go run github.com/dengaleev/glitch-gate/go/socks5-udp-test -socks5 <socks5_addre
 ```sh
 go run github.com/dengaleev/glitch-gate/go/socks5-udp-test -socks5 localhost:1080 -ntp-server time-a-g.nist.gov:123
 ```
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
