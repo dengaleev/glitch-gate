@@ -2,6 +2,7 @@ package url
 
 import (
 	"context"
+	_ "embed"
 
 	"github.com/go-faster/errors"
 	"github.com/jackc/pgx/v5"
@@ -19,9 +20,9 @@ func New(pool *pgxpool.Pool) *Storage {
 }
 
 var (
-	// go:embed sql/insert_url.sql
+	//go:embed insert_url.sql
 	sqlInsertURL string
-	// go:embed sql/get_url.sql
+	//go:embed get_url.sql
 	sqlGetURL string
 )
 
