@@ -1,9 +1,10 @@
 package main
 
 import (
+	"net/http"
+
 	"github.com/dengaleev/glitch-gate/go/yeetit/internal/app"
 	"github.com/dengaleev/glitch-gate/go/yeetit/internal/config"
-	"github.com/dengaleev/glitch-gate/go/yeetit/internal/storage/url"
 	"go.uber.org/fx"
 )
 
@@ -14,8 +15,8 @@ func main() {
 		fx.Provide(app.NewDatabase),
 		fx.Provide(app.NewURLStorage),
 
-		fx.Invoke(func(*url.Storage) error {
-			return nil
-		}),
+		fx.Provide(app.NewServer),
+
+		fx.Invoke(func(*http.Server) error { return nil }),
 	).Run()
 }

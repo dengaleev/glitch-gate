@@ -10,14 +10,14 @@ type Config struct {
 
 	Domain string `env:"DOMAIN" env-required:"true"`
 
-	PostgresDSN string `env:"POSTGRES_DSN" env-required:"true"`
+	PostgresDSN string `env:"POSTGRES_DSN" env-required:"5432"`
 }
 
 func Parse() (*Config, error) {
 	const op = "config.Parse"
 
 	var cfg Config
-	if err := cleanenv.ReadEnv(cfg); err != nil {
+	if err := cleanenv.ReadEnv(&cfg); err != nil {
 		return nil, errors.Wrap(err, op)
 	}
 
