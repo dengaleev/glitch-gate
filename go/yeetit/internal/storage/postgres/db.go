@@ -28,3 +28,6 @@ func New(ctx context.Context, dsn string) (*Database, error) {
 		pool: pool,
 	}, nil
 }
+
+func (db *Database) Pool() *pgxpool.Pool { return db.pool }
+func (db *Database) Close()              { db.pool.Close() }
