@@ -10,7 +10,14 @@ structured = parse_json!(.message)
 . = structured
 '''
 
-[sinks.debug]
-type = "console"
+# [sinks.debug]
+# type = "console"
+# inputs = ["parse_caddy"]
+# encoding.codec = "json"
+
+[sinks.kafka]
+type = "kafka"
 inputs = ["parse_caddy"]
+bootstrap_servers = "kafka:9092"
+topic = "caddy-access"
 encoding.codec = "json"
