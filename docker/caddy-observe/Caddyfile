@@ -1,7 +1,10 @@
 {
 	log {
-		# level DEBUG
 		format json
+		format filter {
+			request>headers>X-Token delete
+		}
+
 		output file /var/log/caddy/access.log {
 			roll_size 1MiB
 			roll_keep 5
