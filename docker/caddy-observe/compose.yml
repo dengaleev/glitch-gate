@@ -1,0 +1,20 @@
+services:
+  caddy:
+    image: caddy:latest
+    ports:
+      - 8080:8080
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_logs:/var/log/caddy
+  vector:
+    image: timberio/vector:0.43.1-debian
+    volumes:
+      - ./vector.toml:/etc/vector/vector.toml
+      - caddy_logs:/var/log/caddy
+    command:
+      - -c
+      - /etc/vector/vector.toml
+
+volumes:
+  caddy_logs:
+    driver: local

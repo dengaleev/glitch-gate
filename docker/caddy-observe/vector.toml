@@ -1,0 +1,16 @@
+[sources.caddy]
+type = "file"
+include = ["/var/log/caddy/access.log*"]
+
+[transforms.parse_caddy]
+type = "remap"
+inputs = ["caddy"]
+source = '''
+structured = parse_json!(.message)
+. = structured
+'''
+
+[sinks.debug]
+type = "console"
+inputs = ["parse_caddy"]
+encoding.codec = "json"

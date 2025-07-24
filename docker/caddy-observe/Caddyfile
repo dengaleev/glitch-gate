@@ -1,0 +1,24 @@
+{
+	log {
+		# level DEBUG
+		format json
+		output file /var/log/caddy/access.log {
+			roll_size 1MiB
+			roll_keep 5
+			roll_keep_for 720h
+		}
+	}
+}
+
+:8080 {
+	log
+
+	handle /info {
+		respond 200 {
+			body `{"remote": "{remote}", "remote_host": "{remote_host}"}`
+			close
+		}
+	}
+
+	respond "Hello, World!"
+}
