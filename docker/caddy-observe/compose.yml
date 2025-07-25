@@ -2,7 +2,7 @@ services:
   caddy:
     image: caddy:latest
     ports:
-      - 8080:8080
+      - '8080:8080/tcp'
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_logs:/var/log/caddy
@@ -18,7 +18,7 @@ services:
   kafka:
     image: docker.io/bitnami/kafka:3.8
     ports:
-      - 9094:9094
+      - '9094:9094/tcp'
     volumes:
       - kafka_data:/bitnami
     environment:
@@ -37,13 +37,24 @@ services:
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     ports:
-      - 13000:8080
+      - '13000:8080/tcp'
     environment:
       KAFKA_CLUSTERS_0_NAME: test-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
       DYNAMIC_CONFIG_ENABLED: true
     depends_on:
       - kafka
+
+  clickhouse:
+    image: 'clickhouse/clickhouse-server:24.8.4.13'
+    user: '101:101'
+    container_name: clickhouse
+    hostname: clickhouse
+    volumes:
+      - ${PWD}/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - '8123:8123/tcp'
+      - '9000:9000/tcp'
 
 volumes:
   caddy_logs:
