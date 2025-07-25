@@ -8,6 +8,7 @@ services:
       - caddy_logs:/var/log/caddy
   vector:
     image: timberio/vector:0.43.1-debian
+    restart: always
     volumes:
       - ./vector.toml:/etc/vector/vector.toml
       - caddy_logs:/var/log/caddy

@@ -9,13 +9,13 @@ SETTINGS kafka_broker_list = 'kafka:9092', kafka_topic_list = 'caddy-access', ka
 CREATE TABLE caddy_access_logs
 (
     `ts` DateTime64(6) NOT NULL,
-    `hostname` String NOT NULL,
+    `hostname` LowCardinality(String) NOT NULL,
     `client_ip` String NOT NULL,
     `remote_ip` String NOT NULL,
     `remote_port` String NOT NULL,
-    `request_method` String NOT NULL,
+    `request_method` LowCardinality(String) NOT NULL,
     `request_uri` String NOT NULL,
-    `http_version` String NOT NULL,
+    `http_version` LowCardinality(String) NOT NULL,
     `request_host` String NOT NULL,
     `user_agent` String NOT NULL,
     `request_size` UInt64 NOT NULL,
