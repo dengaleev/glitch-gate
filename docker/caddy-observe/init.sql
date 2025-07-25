@@ -24,6 +24,7 @@ CREATE TABLE caddy_access_logs
     `duration` Float64 NOT NULL
 )
 ENGINE = MergeTree
+TTL toDateTime(ts) + INTERVAL 12 HOURS
 ORDER BY (ts, hostname)
 ;
 
