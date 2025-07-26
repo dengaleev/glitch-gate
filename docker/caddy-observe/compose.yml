@@ -3,6 +3,7 @@ services:
     image: caddy:latest
     ports:
       - '8080:8080/tcp'
+      - '2019:2019/tcp'
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_logs:/var/log/caddy

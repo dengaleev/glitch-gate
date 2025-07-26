@@ -1,4 +1,11 @@
 {
+	admin :2019
+	servers {
+		metrics {
+			per_host
+		}
+	}
+
 	log {
 		format json
 		format filter {
