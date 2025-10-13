@@ -1,0 +1,32 @@
+[sources.caddy]
+type = "file"
+include = ["/var/log/caddy/access*"]
+fingerprint.strategy = "checksum"
+fingerprint.lines = 10
+
+[transforms.parse_caddy]
+type = "remap"
+inputs = ["caddy"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+structured = parse_json!(.message)
+structured.hostname = .host
+. = structured
+'''
+
+# [sinks.debug]
+# type = "console"
+# inputs = ["parse_caddy"]
+# encoding.codec = "json"
+
+[sinks.kafka]
+type = "kafka"
+inputs = ["parse_caddy"]
+encoding.codec = "json"
+compression = "lz4"
+acknowledgements.enabled = true
+
+bootstrap_servers = "kafka:9092"
+topic = "caddy-access"

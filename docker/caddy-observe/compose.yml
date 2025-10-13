@@ -1,0 +1,65 @@
+services:
+  caddy:
+    image: caddy:latest
+    ports:
+      - '8080:8080/tcp'
+      - '2019:2019/tcp'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_logs:/var/log/caddy
+  vector:
+    image: timberio/vector:0.43.1-debian
+    restart: always
+    volumes:
+      - ./vector.toml:/etc/vector/vector.toml
+      - caddy_logs:/var/log/caddy
+    command:
+      - -c
+      - /etc/vector/vector.toml
+
+  kafka:
+    image: docker.io/bitnami/kafka:3.8
+    ports:
+      - '9094:9094/tcp'
+    volumes:
+      - kafka_data:/bitnami
+    environment:
+      # KRaft settings
+      - KAFKA_CFG_NODE_ID=0
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
+      # Listenerss
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
+
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - '13000:8080/tcp'
+    environment:
+      KAFKA_CLUSTERS_0_NAME: test-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: true
+    depends_on:
+      - kafka
+
+  clickhouse:
+    image: 'clickhouse/clickhouse-server:24.8.4.13'
+    user: '101:101'
+    container_name: clickhouse
+    hostname: clickhouse
+    volumes:
+      - ${PWD}/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - '8123:8123/tcp'
+      - '9000:9000/tcp'
+
+volumes:
+  caddy_logs:
+    driver: local
+  kafka_data:
+    driver: local
