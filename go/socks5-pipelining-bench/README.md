@@ -52,7 +52,7 @@ fresh.
 
 ## Example
 
-User/pass proxy over a ~30 ms link (so the round trips are visible):
+A no-auth proxy over a real ~85 ms link, 3 requests each:
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -60,24 +60,29 @@ User/pass proxy over a ~30 ms link (so the round trips are visible):
 ├────────┬─────────┬───────────┬────────┬────────┤
 │ PHASE  │ REGULAR │ PIPELINED │      Δ │     Δ% │
 ├────────┼─────────┼───────────┼────────┼────────┤
-│ DNS    │       - │         - │      - │      - │
-│ TCP    │    0.27 │      0.35 │  +0.08 │ +28.5% │
-│ SOCKS5 │  190.67 │    102.92 │ -87.75 │ -46.0% │
-│ TLS    │   62.86 │     62.71 │  -0.16 │  -0.2% │
-│ Wait   │  121.66 │    112.78 │  -8.88 │  -7.3% │
-│ TTFB   │  375.53 │    278.83 │ -96.70 │ -25.8% │
-│ TTLB   │  375.70 │    279.00 │ -96.69 │ -25.7% │
+│ DNS    │    5.81 │      3.90 │  -1.91 │ -32.8% │
+│ TCP    │   94.43 │     87.39 │  -7.04 │  -7.5% │
+│ SOCKS5 │  456.62 │    383.53 │ -73.08 │ -16.0% │
+│ TLS    │  200.64 │    206.08 │  +5.44 │  +2.7% │
+│ Wait   │  186.63 │    202.42 │ +15.78 │  +8.5% │
+│ TTFB   │  944.24 │    883.42 │ -60.82 │  -6.4% │
+│ TTLB   │  944.50 │    883.87 │ -60.63 │  -6.4% │
 └────────┴─────────┴───────────┴────────┴────────┘
 ```
 
-Pipelining removes the 2 user/pass round trips: SOCKS5 drops ~2×RTT and TTFB/TTLB
-drop by the same absolute amount. (Per-run tables are printed above this one.)
+Pipelining removes the no-auth greeting round trip: SOCKS5 drops ~1×RTT (~73 ms)
+and TTFB/TTLB fall by the same amount. DNS/TCP/TLS/Wait are untouched by
+pipelining — their deltas here are just run-to-run noise. (Per-run tables print
+above this one; a user/pass proxy saves 2 round trips instead of 1.)
 
 ## Caveats
 
 - **The win scales with the client→proxy RTT.** Pipelining saves 1 (no-auth) or
-  2 (user/pass) round trips *to the proxy*. Against a local proxy (~0 ms) there
-  is nothing to save — point it at your real remote proxy.
-- **SOCKS5 includes the proxy→target connect**, because the server replies only
-  after connecting to the destination. Pipelining removes only the pre-request
-  round trips, so the SOCKS5 delta between the two clients is the clean signal.
+  2 (user/pass) round trips *to the proxy*, so the benefit grows with link
+  latency. Against a local proxy (~0 ms) there is nothing to save.
+- **SOCKS5 includes the proxy→target connect.** The server replies only after
+  connecting to the destination, so that connect — often the largest and most
+  variable part — lands in the SOCKS5 column for both clients. Pipelining removes
+  only the pre-request round trips, so the SOCKS5 delta is the signal; with a
+  small `-n` the target-connect variance can mask (or briefly invert) it, so
+  raise `-n` to average it out.
