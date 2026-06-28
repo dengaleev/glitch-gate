@@ -105,7 +105,7 @@ func readAuth(conn net.Conn) error {
 		return fmt.Errorf("read auth status: %w", err)
 	}
 	if rep.Status != socks5.UserPassStatusSuccess {
-		return socks5.ErrUserPassAuth
+		return fmt.Errorf("authenticate: %w", socks5.ErrUserPassAuth)
 	}
 	return nil
 }
