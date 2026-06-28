@@ -50,9 +50,13 @@ DNS/TCP/SOCKS5 are timed in a custom `DialContext`; TLS/TTFB come from
 `httptrace`. Keep-alives are off and HTTP/1.1 is forced so each request dials
 fresh.
 
+DNS is the lookup of the **proxy's** hostname (`-` for an IP proxy). The target
+is always handed to the proxy to resolve, so its DNS lands inside SOCKS5, not the
+DNS column — and `socks5h://` therefore behaves the same as `socks5://` here.
+
 ## Example
 
-A no-auth proxy over a real ~85 ms link, 3 requests each:
+A no-auth proxy over a real ~89 ms link, `-n 10`:
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -60,20 +64,20 @@ A no-auth proxy over a real ~85 ms link, 3 requests each:
 ├────────┬─────────┬───────────┬────────┬────────┤
 │ PHASE  │ REGULAR │ PIPELINED │      Δ │     Δ% │
 ├────────┼─────────┼───────────┼────────┼────────┤
-│ DNS    │    5.81 │      3.90 │  -1.91 │ -32.8% │
-│ TCP    │   94.43 │     87.39 │  -7.04 │  -7.5% │
-│ SOCKS5 │  456.62 │    383.53 │ -73.08 │ -16.0% │
-│ TLS    │  200.64 │    206.08 │  +5.44 │  +2.7% │
-│ Wait   │  186.63 │    202.42 │ +15.78 │  +8.5% │
-│ TTFB   │  944.24 │    883.42 │ -60.82 │  -6.4% │
-│ TTLB   │  944.50 │    883.87 │ -60.63 │  -6.4% │
+│ DNS    │    3.73 │      4.03 │  +0.30 │  +8.1% │
+│ TCP    │   88.92 │     87.35 │  -1.57 │  -1.8% │
+│ SOCKS5 │  455.07 │    374.70 │ -80.37 │ -17.7% │
+│ TLS    │  198.81 │    200.20 │  +1.39 │  +0.7% │
+│ Wait   │  182.36 │    190.47 │  +8.11 │  +4.4% │
+│ TTFB   │  928.98 │    856.88 │ -72.10 │  -7.8% │
+│ TTLB   │  929.27 │    857.40 │ -71.87 │  -7.7% │
 └────────┴─────────┴───────────┴────────┴────────┘
 ```
 
-Pipelining removes the no-auth greeting round trip: SOCKS5 drops ~1×RTT (~73 ms)
-and TTFB/TTLB fall by the same amount. DNS/TCP/TLS/Wait are untouched by
-pipelining — their deltas here are just run-to-run noise. (Per-run tables print
-above this one; a user/pass proxy saves 2 round trips instead of 1.)
+Pipelining removes the no-auth greeting round trip: SOCKS5 drops ~1×RTT (~80 ms,
+≈ the TCP figure) and TTFB/TTLB fall by the same amount. DNS/TCP/TLS/Wait are
+untouched by pipelining — with enough samples their deltas converge to ~0. (Per-run
+tables print above this one; a user/pass proxy saves 2 round trips instead of 1.)
 
 ## Caveats
 
