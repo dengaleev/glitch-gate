@@ -80,7 +80,6 @@ func main() {
 	fmt.Printf("\n%s\n", footnote(auth))
 }
 
-// measure performs one full request and returns its phase trace and body.
 func measure(ctx context.Context, target string, px *url.URL, pipelined, insecure bool, timeout time.Duration) (*phaseTrace, []byte, error) {
 	pt := &phaseTrace{}
 	tr := &http.Transport{

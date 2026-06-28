@@ -11,19 +11,11 @@ import (
 	"github.com/txthinking/socks5"
 )
 
-// socks5Handshake performs a SOCKS5 CONNECT to target on an already-connected
-// proxy conn, using txthinking/socks5's exported wire primitives.
-//
-// When pipelined is true, the greeting + (optional RFC 1929 user/pass auth) +
-// the CONNECT request are written in a SINGLE Write and the 2-3 replies are then
-// read in order — collapsing the handshake to one round trip. When false it does
-// the standard sequential round trips, which is byte-for-byte what
-// socks5.Client.Dial sends.
-//
-// Pipelining is safe here because the client always advertises exactly ONE auth
-// method (no-auth, or user/pass when credentials are set), so the server's
-// method-selection reply is fully predictable and the request bytes do not
-// depend on any reply.
+// socks5Handshake does a SOCKS5 CONNECT to target on an already-connected proxy
+// conn. The sequential path is byte-for-byte what socks5.Client.Dial sends; the
+// pipelined path batches greeting+auth+request into one Write, saving 1-2 round
+// trips. Batching is safe only because the client advertises a single auth
+// method, so the reply is predictable and the request never depends on it.
 func socks5Handshake(conn net.Conn, user, pass, target string, pipelined bool) error {
 	method := socks5.MethodNone
 	if user != "" {
@@ -46,7 +38,6 @@ func socks5Handshake(conn net.Conn, user, pass, target string, pipelined bool) e
 	request := socks5.NewRequest(socks5.CmdConnect, atyp, addr, port)
 
 	if pipelined {
-		// One coalesced write: greeting [+ auth] + request.
 		var buf bytes.Buffer
 		_, _ = greeting.WriteTo(&buf)
 		if auth != nil {
@@ -67,7 +58,6 @@ func socks5Handshake(conn net.Conn, user, pass, target string, pipelined bool) e
 		return readReply(conn)
 	}
 
-	// Sequential: write-then-read at every phase (== socks5.Client.Dial).
 	if _, err := greeting.WriteTo(conn); err != nil {
 		return fmt.Errorf("write greeting: %w", err)
 	}
@@ -121,9 +111,8 @@ func readReply(conn net.Conn) error {
 	return nil
 }
 
-// makeDialContext returns an http.Transport.DialContext that connects to the
-// SOCKS5 proxy and tunnels to the requested target, recording per-phase
-// timestamps (proxy DNS, proxy TCP connect, SOCKS5 handshake) into pt.
+// makeDialContext returns a DialContext that dials the SOCKS5 proxy, tunnels to
+// target, and records the proxy DNS/TCP/handshake timestamps into pt.
 func makeDialContext(px *url.URL, pipelined bool, pt *phaseTrace) func(context.Context, string, string) (net.Conn, error) {
 	user := px.User.Username()
 	pass, _ := px.User.Password()
