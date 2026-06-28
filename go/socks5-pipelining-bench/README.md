@@ -1,110 +1,83 @@
 # socks5-pipelining-bench
 
-A tiny CLI that fetches a URL through a SOCKS5 proxy and compares a **regular
-(sequential) SOCKS5 handshake** against a **pipelined** one — greeting +
-(optional auth) + `CONNECT` request written in a single packet — reporting a
-per-phase latency breakdown via `net/http/httptrace`.
+Fetches a URL through a SOCKS5 proxy and compares a **regular** (sequential)
+SOCKS5 handshake against a **pipelined** one, printing a per-phase latency
+breakdown via `net/http/httptrace`.
 
-It does `-n` requests with each client (interleaved) and prints conn-establish,
-SOCKS5-handshake, TLS, server-wait, TTFB and TTLB metrics side by side.
+## Handshake pipelining
 
-## Background
+The SOCKS5 client handshake is normally 2 round trips (no-auth) or 3 (user/pass):
+greeting → method reply → [auth → auth reply] → request → reply. When the client
+commits to a single auth method up front, the server's method reply is
+predictable, so it can write the greeting + (optional auth) + CONNECT request in
+**one packet** and read the replies in order — collapsing the handshake to one
+round trip.
 
-The RFC 1928 / RFC 1929 client handshake is normally `2` round trips (no-auth)
-or `3` (user/pass): greeting → method reply → [auth → auth reply] → request →
-reply. When the client commits to **exactly one auth method** up front it can
-predict the server's method selection, so it may write the greeting, auth and
-request **back-to-back** and read the replies in order — collapsing the
-handshake to **one round trip**. See
-[`../socks5-libs-comparison`](../socks5-libs-comparison/README.md#handshake-pipelining-a-client-latency-optimization)
-for which libraries support this.
-
-Both handshakes here are built from `github.com/txthinking/socks5`'s exported
-wire primitives. The **regular** path is byte-for-byte what `socks5.Client.Dial`
-sends; the **pipelined** path sends the same bytes in one `Write`.
+Both handshakes are built from `github.com/txthinking/socks5`'s wire primitives:
+the regular path is byte-for-byte what `socks5.Client.Dial` sends; the pipelined
+path batches the writes.
 
 ## Usage
 
 ```sh
-go run github.com/dengaleev/glitch-gate/go/socks5-pipelining-bench@latest \
-    socks5://user:pass@proxy-host:1080
+go run . socks5://user:pass@proxy-host:1080
 ```
 
 ```
-socks5-pipelining-bench [flags] socks5://[user:pass@]host:port
-
-  -target string   destination URL (default "https://www.cloudflare.com/cdn-cgi/trace")
-  -n int           measured requests per client (default 3)
-  -timeout dur     per-request timeout (default 30s)
-  -insecure        skip TLS certificate verification
-  -no-warmup       skip the unmeasured warm-up request
+-target string   URL to fetch (default: Cloudflare cdn-cgi/trace)
+-n int           measured requests per client (default 3)
+-timeout dur     per-request timeout (default 30s)
+-insecure        skip TLS certificate verification
+-no-warmup       skip the warm-up request
 ```
 
-- The proxy URL is the only positional argument (`socks5://` or `socks5h://`;
-  port defaults to `1080`). Credentials in the URL trigger user/pass auth.
-- The default target is Cloudflare's `cdn-cgi/trace` (returns `ip=`, `colo=`,
-  etc.); the tool prints the `ip`/`colo` from a warm-up request as a sanity line.
+The proxy URL is the only argument (`socks5://` or `socks5h://`; port defaults to
+1080). Credentials trigger user/pass auth.
 
-## Metrics
-
-All times in milliseconds.
+## Metrics (ms)
 
 | Column | Meaning |
 | --- | --- |
-| `DNS`    | Proxy hostname resolution (`-` if the proxy is an IP). |
-| `TCP`    | TCP connection establishment **to the proxy**. |
-| `SOCKS5` | SOCKS5 handshake: from TCP-connected to the `CONNECT` reply. |
-| `TLS`    | TLS handshake to the target, through the tunnel (https only). |
-| `Wait`   | Server processing: connection-ready → first response byte. |
-| `TTFB`   | Time to first byte, from request start. |
-| `TTLB`   | Time to last byte (full body read), from request start. |
+| DNS    | proxy hostname resolution (`-` if the proxy is an IP) |
+| TCP    | TCP connect to the proxy |
+| SOCKS5 | SOCKS5 handshake (TCP-connected → CONNECT reply) |
+| TLS    | TLS handshake to the target, through the tunnel (https) |
+| Wait   | server processing: connection ready → first byte |
+| TTFB   | time to first byte |
+| TTLB   | time to last byte (total) |
 
-DNS/TCP/SOCKS5 are timed inside a custom `http.Transport.DialContext`; TLS and
-TTFB come from `httptrace.ClientTrace`; TTLB is measured around the body read.
-Keep-alives are disabled and HTTP/1.1 is forced so every request performs a full
-fresh dial + handshake.
+DNS/TCP/SOCKS5 are timed in a custom `DialContext`; TLS/TTFB come from
+`httptrace`. Keep-alives are off and HTTP/1.1 is forced so each request dials
+fresh.
 
 ## Example
 
-Against a proxy with ~30 ms link latency (so round trips are visible), user/pass auth:
+User/pass proxy over a ~30 ms link (so the round trips are visible):
 
 ```
-Regular (sequential handshake)
-  run  DNS   TCP  SOCKS5    TLS    Wait    TTFB    TTLB
-    1    -  0.38  188.33  63.02  113.72  365.56  365.74
-    2    -  0.31  189.57  62.97  113.63  366.56  366.71
-    3    -  0.23  185.56  62.99  113.02  361.87  362.11
-  avg    -  0.31  187.82  62.99  113.46  364.66  364.86
-
-Pipelined (greeting+auth+request in one write)
-  run  DNS   TCP  SOCKS5    TLS    Wait    TTFB    TTLB
-    1    -  0.33   91.85  62.97  115.69  270.94  271.11
-    2    -  0.19   92.43  62.91  112.59  268.19  268.31
-    3    -  0.15   91.68  63.04  113.39  268.36  268.52
-  avg    -  0.23   91.99  62.97  113.89  269.16  269.31
-
-Comparison (averages)
-   phase  regular  pipelined   delta  delta%
-     DNS        -          -       -       -
-     TCP     0.31       0.23   -0.08  -25.8%
-  SOCKS5   187.82      91.99  -95.84  -51.0%
-     TLS    62.99      62.97   -0.02   -0.0%
-    Wait   113.46     113.89   +0.43   +0.4%
-    TTFB   364.66     269.16  -95.50  -26.2%
-    TTLB   364.86     269.31  -95.54  -26.2%
+┌────────────────────────────────────────────────┐
+│ Comparison — averages (ms)                     │
+├────────┬─────────┬───────────┬────────┬────────┤
+│ PHASE  │ REGULAR │ PIPELINED │      Δ │     Δ% │
+├────────┼─────────┼───────────┼────────┼────────┤
+│ DNS    │       - │         - │      - │      - │
+│ TCP    │    0.27 │      0.35 │  +0.08 │ +28.5% │
+│ SOCKS5 │  190.67 │    102.92 │ -87.75 │ -46.0% │
+│ TLS    │   62.86 │     62.71 │  -0.16 │  -0.2% │
+│ Wait   │  121.66 │    112.78 │  -8.88 │  -7.3% │
+│ TTFB   │  375.53 │    278.83 │ -96.70 │ -25.8% │
+│ TTLB   │  375.70 │    279.00 │ -96.69 │ -25.7% │
+└────────┴─────────┴───────────┴────────┴────────┘
 ```
 
-Here pipelining removes the 2 user/pass round trips: SOCKS5 drops by ~2×RTT and
-TTFB/TTLB drop by the same absolute amount.
+Pipelining removes the 2 user/pass round trips: SOCKS5 drops ~2×RTT and TTFB/TTLB
+drop by the same absolute amount. (Per-run tables are printed above this one.)
 
-## Reading the results — two caveats
+## Caveats
 
-1. **The win scales with the client→proxy RTT.** Pipelining saves `1` (no-auth)
-   or `2` (user/pass) *round trips to the proxy*. Against a **local** proxy
-   (≈0 ms RTT) there is essentially nothing to save and the numbers will look
-   equal or noisy. Run it against your real, remote proxy to see the benefit.
-2. **The `SOCKS5` phase includes the proxy→target connect.** A SOCKS5 server
-   sends its `CONNECT` reply only *after* it has connected to the destination,
-   so that connect time (and its variance) lands in the `SOCKS5` column for both
-   clients. Pipelining doesn't change it; it only removes the *pre-request*
-   round trips. The `SOCKS5` delta between the two clients is the clean signal.
+- **The win scales with the client→proxy RTT.** Pipelining saves 1 (no-auth) or
+  2 (user/pass) round trips *to the proxy*. Against a local proxy (~0 ms) there
+  is nothing to save — point it at your real remote proxy.
+- **SOCKS5 includes the proxy→target connect**, because the server replies only
+  after connecting to the destination. Pipelining removes only the pre-request
+  round trips, so the SOCKS5 delta between the two clients is the clean signal.
