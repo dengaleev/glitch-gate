@@ -143,7 +143,7 @@ func parseProxy(arg string) (*url.URL, error) {
 
 func sample(body []byte) string {
 	var ip, colo string
-	for _, line := range strings.Split(string(body), "\n") {
+	for line := range strings.SplitSeq(string(body), "\n") {
 		if v, ok := strings.CutPrefix(line, "ip="); ok {
 			ip = v
 		}
