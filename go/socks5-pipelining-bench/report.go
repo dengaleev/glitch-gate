@@ -3,8 +3,11 @@ package main
 import (
 	"fmt"
 	"io"
-	"text/tabwriter"
+	"strconv"
 	"time"
+
+	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/jedib0t/go-pretty/v6/text"
 )
 
 // phaseTrace holds the absolute timestamps captured during one request, both
@@ -55,9 +58,6 @@ func (pt *phaseTrace) result() result {
 
 func mean(rs []result) result {
 	var m result
-	if len(rs) == 0 {
-		return m
-	}
 	for _, r := range rs {
 		m.dns += r.dns
 		m.tcp += r.tcp
@@ -67,14 +67,15 @@ func mean(rs []result) result {
 		m.ttfb += r.ttfb
 		m.ttlb += r.ttlb
 	}
-	n := time.Duration(len(rs))
-	m.dns /= n
-	m.tcp /= n
-	m.socks /= n
-	m.tls /= n
-	m.wait /= n
-	m.ttfb /= n
-	m.ttlb /= n
+	if n := time.Duration(len(rs)); n > 0 {
+		m.dns /= n
+		m.tcp /= n
+		m.socks /= n
+		m.tls /= n
+		m.wait /= n
+		m.ttfb /= n
+		m.ttlb /= n
+	}
 	return m
 }
 
@@ -88,30 +89,48 @@ func cell(d time.Duration) string {
 	return ms(d)
 }
 
-func renderRuns(w io.Writer, title string, rs []result) {
-	fmt.Fprintf(w, "%s\n", title)
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(tw, "run\tDNS\tTCP\tSOCKS5\tTLS\tWait\tTTFB\tTTLB\t")
-	for i, r := range rs {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n",
-			i+1, cell(r.dns), ms(r.tcp), ms(r.socks),
-			cell(r.tls), ms(r.wait), ms(r.ttfb), ms(r.ttlb))
+var phaseHeader = table.Row{"run", "DNS", "TCP", "SOCKS5", "TLS", "Wait", "TTFB", "TTLB"}
+
+// newTable builds a styled table with every column right-aligned except the
+// first (the label column).
+func newTable(w io.Writer, title string, cols int) table.Writer {
+	t := table.NewWriter()
+	t.SetOutputMirror(w)
+	t.SetTitle(title)
+	t.SetStyle(table.StyleLight)
+	cfgs := make([]table.ColumnConfig, 0, cols-1)
+	for i := 2; i <= cols; i++ {
+		cfgs = append(cfgs, table.ColumnConfig{
+			Number:      i,
+			Align:       text.AlignRight,
+			AlignHeader: text.AlignRight,
+			AlignFooter: text.AlignRight,
+		})
 	}
-	m := mean(rs)
-	fmt.Fprintf(tw, "avg\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n",
-		cell(m.dns), ms(m.tcp), ms(m.socks),
-		cell(m.tls), ms(m.wait), ms(m.ttfb), ms(m.ttlb))
-	_ = tw.Flush()
-	fmt.Fprintln(w)
+	t.SetColumnConfigs(cfgs)
+	return t
+}
+
+func runRow(label string, r result) table.Row {
+	return table.Row{label, cell(r.dns), ms(r.tcp), ms(r.socks), cell(r.tls), ms(r.wait), ms(r.ttfb), ms(r.ttlb)}
+}
+
+func renderRuns(w io.Writer, title string, rs []result) {
+	t := newTable(w, title, len(phaseHeader))
+	t.AppendHeader(phaseHeader)
+	for i, r := range rs {
+		t.AppendRow(runRow(strconv.Itoa(i+1), r))
+	}
+	t.AppendFooter(runRow("avg", mean(rs)))
+	t.Render()
 }
 
 func renderComparison(w io.Writer, reg, pip result) {
-	fmt.Fprintln(w, "Comparison (averages)")
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(tw, "phase\tregular\tpipelined\tdelta\tdelta%\t")
-	row := func(name string, a, b time.Duration, has bool) {
-		if !has {
-			fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t\n", name)
+	t := newTable(w, "Comparison — averages (ms)", 5)
+	t.AppendHeader(table.Row{"phase", "regular", "pipelined", "Δ", "Δ%"})
+	row := func(name string, a, b time.Duration, optional bool) {
+		if optional && (a == 0 || b == 0) {
+			t.AppendRow(table.Row{name, "-", "-", "-", "-"})
 			return
 		}
 		delta := b - a
@@ -119,15 +138,16 @@ func renderComparison(w io.Writer, reg, pip result) {
 		if a != 0 {
 			pct = float64(delta) / float64(a) * 100
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%+.2f\t%+.1f%%\t\n",
-			name, ms(a), ms(b), float64(delta)/float64(time.Millisecond), pct)
+		t.AppendRow(table.Row{name, ms(a), ms(b),
+			fmt.Sprintf("%+.2f", float64(delta)/float64(time.Millisecond)),
+			fmt.Sprintf("%+.1f%%", pct)})
 	}
-	row("DNS", reg.dns, pip.dns, reg.dns != 0)
-	row("TCP", reg.tcp, pip.tcp, true)
-	row("SOCKS5", reg.socks, pip.socks, true)
-	row("TLS", reg.tls, pip.tls, reg.tls != 0)
-	row("Wait", reg.wait, pip.wait, true)
-	row("TTFB", reg.ttfb, pip.ttfb, true)
-	row("TTLB", reg.ttlb, pip.ttlb, true)
-	_ = tw.Flush()
+	row("DNS", reg.dns, pip.dns, true)
+	row("TCP", reg.tcp, pip.tcp, false)
+	row("SOCKS5", reg.socks, pip.socks, false)
+	row("TLS", reg.tls, pip.tls, true)
+	row("Wait", reg.wait, pip.wait, false)
+	row("TTFB", reg.ttfb, pip.ttfb, false)
+	row("TTLB", reg.ttlb, pip.ttlb, false)
+	t.Render()
 }

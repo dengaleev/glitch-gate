@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -37,25 +38,23 @@ func main() {
 	auth := px.User.Username() != ""
 	ctx := context.Background()
 
-	fmt.Println("SOCKS5 handshake benchmark — regular vs pipelined")
-	fmt.Printf("proxy : %s (auth: %s)\n", px.Redacted(), yesno(auth))
+	fmt.Printf("proxy:  %s (auth: %s)\n", px.Redacted(), yesno(auth))
 	fmt.Printf("target: %s\n", *target)
-	fmt.Printf("runs  : %d each, interleaved, HTTP/1.1, keep-alive disabled\n", *n)
 
 	if !*noWarmup {
 		_, body, err := measure(ctx, *target, px, false, *insecure, *timeout)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "\nwarm-up request failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "warm-up request failed: %v\n", err)
 			os.Exit(1)
 		}
 		if s := sample(body); s != "" {
 			fmt.Printf("sample: %s\n", s)
 		}
 	}
-	fmt.Print("\nAll times in milliseconds.\n\n")
+	fmt.Println()
 
 	var reg, pip []result
-	for i := 0; i < *n; i++ {
+	for i := range *n {
 		// Interleave regular/pipelined so neither eats network warm-up bias.
 		if pt, _, err := measure(ctx, *target, px, false, *insecure, *timeout); err != nil {
 			fmt.Fprintf(os.Stderr, "regular run %d failed: %v\n", i+1, err)
@@ -74,21 +73,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	renderRuns(os.Stdout, "Regular (sequential handshake)", reg)
-	renderRuns(os.Stdout, "Pipelined (greeting+auth+request in one write)", pip)
+	renderRuns(os.Stdout, "Regular — sequential (ms)", reg)
+	fmt.Println()
+	renderRuns(os.Stdout, "Pipelined — one write (ms)", pip)
+	fmt.Println()
 	renderComparison(os.Stdout, mean(reg), mean(pip))
-	fmt.Printf("\n%s\n", footnote(auth))
 }
 
 func measure(ctx context.Context, target string, px *url.URL, pipelined, insecure bool, timeout time.Duration) (*phaseTrace, []byte, error) {
 	pt := &phaseTrace{}
+	// Force HTTP/1.1 for clean, comparable trace semantics.
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
 	tr := &http.Transport{
 		DialContext:       makeDialContext(px, pipelined, pt),
 		DisableKeepAlives: true,
-		ForceAttemptHTTP2: false,
-		// Force HTTP/1.1 for clean, comparable trace semantics.
-		TLSNextProto:    map[string]func(string, *tls.Conn) http.RoundTripper{},
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+		Protocols:         protocols,
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: insecure},
 	}
 	defer tr.CloseIdleConnections()
 
@@ -125,7 +126,7 @@ func measure(ctx context.Context, target string, px *url.URL, pipelined, insecur
 
 func parseProxy(arg string) (*url.URL, error) {
 	if arg == "" {
-		return nil, fmt.Errorf("missing SOCKS5 proxy URL argument")
+		return nil, errors.New("missing SOCKS5 proxy URL argument")
 	}
 	u, err := url.Parse(arg)
 	if err != nil {
@@ -158,15 +159,6 @@ func sample(body []byte) string {
 		parts = append(parts, "colo="+colo)
 	}
 	return strings.Join(parts, " ")
-}
-
-func footnote(auth bool) string {
-	saved := "1 round trip (no-auth)"
-	if auth {
-		saved = "2 round trips (user/pass)"
-	}
-	return "Note: SOCKS5 is the only phase pipelining changes — it removes " + saved + ".\n" +
-		"TTFB/TTLB should improve by ~the same absolute amount; DNS/TCP/TLS/Wait are unaffected."
 }
 
 func yesno(b bool) string {

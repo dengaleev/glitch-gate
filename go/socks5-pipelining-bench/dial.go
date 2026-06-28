@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"net"
@@ -117,10 +118,7 @@ func makeDialContext(px *url.URL, pipelined bool, pt *phaseTrace) func(context.C
 	user := px.User.Username()
 	pass, _ := px.User.Password()
 	host := px.Hostname()
-	port := px.Port()
-	if port == "" {
-		port = "1080"
-	}
+	port := cmp.Or(px.Port(), "1080")
 
 	return func(ctx context.Context, _ /*network*/, target string) (net.Conn, error) {
 		ip := host
