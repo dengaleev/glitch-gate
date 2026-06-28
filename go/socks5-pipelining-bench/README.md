@@ -90,3 +90,11 @@ tables print above this one; a user/pass proxy saves 2 round trips instead of 1.
   only the pre-request round trips, so the SOCKS5 delta is the signal; with a
   small `-n` the target-connect variance can mask (or briefly invert) it, so
   raise `-n` to average it out.
+- **Occasional spikes skew the average.** A real proxy will now and then take
+  ~1 s to reach the target (e.g. a dropped SYN getting retransmitted), and that
+  lands in the `SOCKS5` column. Such outliers pull the **mean** up
+  disproportionately — and they rarely hit both clients equally — so read the
+  effect from the per-run spread, not just the headline `avg`. Outlier-discounted
+  (median), the steady saving is ~1 RTT (no-auth) / ~2 RTT (user/pass): e.g. one
+  50-sample run measured ~87 ms (no-auth) and ~172 ms (user/pass) against an
+  ~88 ms link.
