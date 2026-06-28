@@ -347,6 +347,103 @@ mostly about the data‑plane design:
 
 ---
 
+## Handshake pipelining (a client latency optimization)
+
+The RFC 1928 / RFC 1929 client handshake is normally a sequence of
+request→response round trips:
+
+```
+client → greeting (VER, NMETHODS, METHODS)
+client ← method selection (VER, METHOD)              # round trip 1
+[ if user/pass ]
+client → auth (VER, ULEN, UNAME, PLEN, PASSWD)
+client ← auth status (VER, STATUS)                   # round trip 2
+client → request (VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT)
+client ← reply (VER, REP, RSV, ATYP, BND.ADDR, BND.PORT)   # round trip 3
+```
+
+That's **2 round trips (no‑auth) or 3 (user/pass)** before the tunnel is usable —
+painful on high‑latency links, and proxies are frequently high‑latency.
+
+**The pipelining opportunity.** When the client commits to **exactly one auth
+method up front** — i.e. it *already knows which authorization it will use* — the
+server's method‑selection reply is fully predictable. The client can then write
+the greeting + (optional auth sub‑negotiation) + the request **back‑to‑back
+without waiting for each reply** (ideally coalesced into one `Write`), then read
+the 2–3 replies in order. This collapses the handshake to **one round trip**. If
+a misbehaving server rejects the method/auth, the eagerly‑sent bytes are simply
+discarded when the connection closes — so it's safe, provided the client still
+validates each reply.
+
+**Two preconditions hold for *every* Go client surveyed**, so they don't
+differentiate:
+
+1. **Replies are read with `io.ReadFull` on the raw `net.Conn`** (no
+   `bufio.Reader` read‑ahead, nothing flushed/discarded between phases) — so
+   reading a batched set of replies in order Just Works.
+2. **The `CONNECT`/`UDP` request bytes never depend on a handshake reply** (they
+   come from the destination, known up front) — so they can be written early.
+
+So the deciding factor is purely **how many auth methods the greeting
+advertises** — exactly the "when we exactly know about authorization" condition.
+
+### Which client can be extended?
+
+| Client | Advertises auth methods | Already pipelined? | Extend to pipeline | Why |
+| --- | --- | :-: | --- | --- |
+| **Outline SDK** `transport/socks5` | single (always) | ✅ **yes** | already done | **Reference impl**: assembles greeting+auth+request in one buffer, one `Write`, then ordered `io.ReadFull`. 1 RTT. |
+| **`sagernet/sing`** socks | single (always) | ❌ | **easy** | `ClientHandshake5` already advertises one method (`[]byte{method}`); just an additive variant that concatenates the writes. |
+| **`txthinking/socks5`** | single (always) | ❌ | **moderate** | Structurally ~90% there; only obstacle is that writes are split across the public `Negotiate()` + `Request()` methods. Add a new method (no breaking change). |
+| **`go-gost/gosocks5`** | single (default selector); configurable | ❌ | moderate | Default selector offers one method, but the request write is *caller‑side* and auth is fused inside `Selector.OnSelected` — needs an API path change. |
+| **`wzshiming/socks5`** | single (no‑auth) / **two (user/pass)** | ❌ | moderate | Clean injectable design, but the user/pass path advertises **both** `0x00`+`0x02`; must commit to a single method to pipeline that path. No‑auth path is already pipelinable. |
+| **`golang.org/x/net/proxy`** | **two (user/pass via public API)** | ❌ | hard | `proxy.SOCKS5()` advertises **both** no‑auth and user/pass whenever auth is set, so auth can't be pipelined without a behavior change — in a *frozen, internal* package. Only the no‑auth path is naturally pipelinable. |
+
+> Server‑only libraries (`armon`, `things-go`, `haxii`, `getlantern`) and the
+> client‑less `go-shadowsocks2/socks` have no client handshake to optimize. Note
+> they *interoperate* with a pipelining client fine: each reads messages with
+> `io.ReadFull`/`bufio.Reader` and doesn't discard buffered bytes between phases,
+> so early‑arriving client bytes are consumed correctly.
+
+**Best candidates:** the three that **always advertise a single method** —
+`sing` (easiest), `txthinking` (best ROI here, see below), and Outline (already
+done). `wzshiming` and `x/net/proxy` need a single‑method *behavior change* on
+the user/pass path first, and `x/net` is additionally policy‑frozen.
+
+### Sketch: adding it to `txthinking/socks5` (this repo's lib)
+
+`txthinking` always sets one method (`MethodNone`, or `MethodUsernamePassword`
+when creds are present), reads every reply via `io.ReadFull`, and builds the
+`CONNECT` request from `dst` *before* `Negotiate` runs. Today `Dial` does:
+
+```go
+c.Negotiate(laddr)                       // write greeting → read; [write auth → read]
+c.Request(NewRequest(CmdConnect, a,h,p)) // write request → read
+```
+
+A pipelined variant (new method, no API break) would:
+
+```go
+// 1. dial proxy; pick the single method m (MethodNone | MethodUsernamePassword)
+// 2. assemble all outbound bytes up front:
+buf := NewNegotiationRequest([]byte{m}).bytes()        // 05 01 m
+if m == MethodUsernamePassword {
+    buf = append(buf, NewUserPassNegotiationRequest(u, p).bytes()...)
+}
+buf = append(buf, NewRequest(CmdConnect, a, h, p).bytes()...)
+c.TCPConn.Write(buf)                                   // ONE write (1 RTT)
+// 3. read replies in order, validating each:
+//    NewNegotiationReplyFrom  → rp.Method == m
+//    [NewUserPassNegotiationReplyFrom → Status == success]
+//    NewReplyFrom             → Rep == success   (and rp.Address() for UDP)
+```
+
+The only plumbing missing is `Bytes()` accessors on the request types (or just
+reuse the same `append(...)` assembly their `WriteTo` methods already do).
+Keep it conditional on "single method advertised" so any future multi‑method
+support falls back to the sequential path.
+
+---
+
 ## Decision guide
 
 ```
