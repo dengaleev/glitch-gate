@@ -130,6 +130,64 @@ func TestEarlyDataReachesTargetUserPass(t *testing.T) {
 	}
 }
 
+// TestConcurrentReadWriteCoalesces validates the ClientDataWait fix: when a
+// Read is already blocked (as net/http's readLoop is while the writeLoop
+// prepares the request), the first Write must still coalesce its payload into
+// the single handshake write rather than the Read flushing a bare handshake
+// first. Coalescing succeeded iff exactly one write reached the proxy.
+func TestConcurrentReadWriteCoalesces(t *testing.T) {
+	target, err := StartEchoTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	proxy, err := StartProxy("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	var cc *CountingConn
+	dial := func() (net.Conn, error) {
+		raw, err := net.Dial("tcp", proxy.Addr)
+		if err != nil {
+			return nil, err
+		}
+		cc = &CountingConn{Conn: raw}
+		return cc, nil
+	}
+	conn, err := Dial(proxy.Addr, "", "", target.Addr, dial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	payload := []byte("concurrent-coalesce")
+	done := make(chan []byte, 1)
+	go func() {
+		got := make([]byte, len(payload))
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			done <- nil
+			return
+		}
+		done <- got
+	}()
+
+	// Let the reader enter its ClientDataWait window, then write.
+	time.Sleep(2 * time.Millisecond)
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := <-done
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("echo mismatch: got %q want %q", got, payload)
+	}
+	if w := cc.Writes(); w != 1 {
+		t.Fatalf("coalescing lost under concurrent read/write: %d proxy writes, want 1", w)
+	}
+}
+
 // TestServerSpeaksFirstFallback covers the read-before-write case (SMTP/SSH-style
 // banners): the application reads first, so there is no early data to coalesce.
 // The handshake must still flush (degrading to handshake pipelining) so the

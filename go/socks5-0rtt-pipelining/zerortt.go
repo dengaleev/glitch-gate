@@ -35,6 +35,12 @@ import (
 	"github.com/txthinking/socks5"
 )
 
+// DefaultClientDataWait is how long the first Read waits for a concurrent first
+// Write to supply early data before flushing the handshake alone. It mirrors
+// Outline SDK's Shadowsocks ClientDataWait: longer than any reasonable
+// inter-goroutine handoff, shorter than a real network RTT.
+const DefaultClientDataWait = 10 * time.Millisecond
+
 // Conn is a deferred-handshake SOCKS5 CONNECT connection. It implements
 // net.Conn. The SOCKS5 handshake is not performed at dial time; it is buffered
 // and flushed, prepended to the application's first Write (carrying it as 0-RTT
@@ -47,8 +53,18 @@ type Conn struct {
 	method byte
 	pre    []byte // assembled handshake: greeting || [auth] || CONNECT
 
-	wmu     sync.Mutex // serializes writes and guards the one-time flush
-	flushed bool
+	// ClientDataWait bounds how long the first Read blocks for a concurrent
+	// first Write to provide early data before it flushes the handshake alone.
+	// This makes 0-RTT coalescing reliable when the caller reads and writes
+	// from separate goroutines (net/http's Transport runs a readLoop and a
+	// writeLoop), at the cost of up to this much added latency for a purely
+	// read-first protocol. Set to 0 to flush immediately on a read-first Read.
+	ClientDataWait time.Duration
+
+	wmu       sync.Mutex    // serializes writes and guards the one-time flush
+	flushed   bool          // handshake bytes have been written
+	flushErr  error         // result of writing the handshake bytes
+	flushedCh chan struct{} // closed once, after the handshake bytes are written
 
 	rmu      sync.Mutex // guards the one-time reply validation
 	replied  bool
@@ -82,7 +98,13 @@ func Dial(proxyAddr, user, pass, dst string, dialProxy func() (net.Conn, error))
 	if err != nil {
 		return nil, fmt.Errorf("dial proxy %s: %w", proxyAddr, err)
 	}
-	return &Conn{raw: raw, method: method, pre: pre}, nil
+	return &Conn{
+		raw:            raw,
+		method:         method,
+		pre:            pre,
+		ClientDataWait: DefaultClientDataWait,
+		flushedCh:      make(chan struct{}),
+	}, nil
 }
 
 // buildHandshake assembles the exact wire bytes for greeting || [auth] ||
@@ -126,22 +148,25 @@ func (c *Conn) Flush() error {
 
 // flush writes the handshake exactly once, optionally with early application
 // data appended, and returns how many bytes of early were written. After the
-// first flush it simply forwards early to the raw conn.
+// first flush it forwards early to the raw conn (unless the handshake write
+// itself failed, in which case that error is returned without touching the
+// wire again).
 func (c *Conn) flush(early []byte) (int, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 
 	if c.flushed {
-		if len(early) == 0 {
-			return 0, nil
+		if c.flushErr != nil || len(early) == 0 {
+			return 0, c.flushErr
 		}
 		return c.raw.Write(early)
 	}
 	c.flushed = true
+	defer close(c.flushedCh) // runs before wmu.Unlock; wakes a waiting Read
 
 	if len(early) == 0 {
-		_, err := c.raw.Write(c.pre)
-		return 0, err
+		_, c.flushErr = c.raw.Write(c.pre)
+		return 0, c.flushErr
 	}
 
 	// One write: handshake immediately followed by the first payload.
@@ -149,6 +174,7 @@ func (c *Conn) flush(early []byte) (int, error) {
 	buf = append(buf, c.pre...)
 	buf = append(buf, early...)
 	n, err := c.raw.Write(buf)
+	c.flushErr = err
 
 	// Report only application bytes. A net.Conn Write blocks until all bytes
 	// are sent or it errors, so on success n == len(buf) and appN == len(early).
@@ -161,6 +187,12 @@ func (c *Conn) flush(early []byte) (int, error) {
 	return appN, err
 }
 
+func (c *Conn) isFlushed() bool {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	return c.flushed
+}
+
 // Read returns tunneled data from the target. It first guarantees the
 // handshake is on the wire (flushing it alone if the application has not
 // written yet) and then, once, reads and validates the method / [auth] /
@@ -169,6 +201,18 @@ func (c *Conn) flush(early []byte) (int, error) {
 // proxy may have coalesced into the same TCP segment is left intact for this
 // and subsequent reads.
 func (c *Conn) Read(b []byte) (int, error) {
+	// Give a concurrent first Write a brief window to supply early data before
+	// we flush the handshake alone. Without this, net/http's readLoop racing
+	// its writeLoop could flush a bare handshake and silently lose the 0-RTT
+	// coalescing. (Outline SDK uses the same bounded-wait trick.)
+	if c.ClientDataWait > 0 && !c.isFlushed() {
+		t := time.NewTimer(c.ClientDataWait)
+		select {
+		case <-c.flushedCh:
+		case <-t.C:
+		}
+		t.Stop()
+	}
 	if _, err := c.flush(nil); err != nil {
 		return 0, err
 	}

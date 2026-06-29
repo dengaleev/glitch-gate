@@ -17,6 +17,12 @@ Both handshakes are built from `github.com/txthinking/socks5`'s wire primitives:
 the regular path is byte-for-byte what `socks5.Client.Dial` sends; the pipelined
 path batches the writes.
 
+> **Going further.** Pipelining still waits for the CONNECT reply before the
+> application sends its first byte. The next layer —
+> [`../socks5-0rtt-pipelining`](../socks5-0rtt-pipelining) — appends that first
+> payload (e.g. the TLS ClientHello) to the same write, sent *before* any reply
+> is read, removing one more round trip ("0-RTT data pipelining").
+
 ## Usage
 
 ```sh
