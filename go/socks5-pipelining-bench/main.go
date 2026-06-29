@@ -1,8 +1,12 @@
-// Command socks5-pipelining-bench compares a regular (sequential) SOCKS5
-// handshake against a pipelined one (greeting + auth + request in a single
-// write) by fetching a URL through a SOCKS5 proxy N times each and reporting a
-// per-phase latency breakdown (proxy DNS, TCP connect, SOCKS5 handshake, TLS,
-// server wait, TTFB, TTLB) using net/http/httptrace.
+// Command socks5-pipelining-bench compares the SOCKS5 tunnel-setup strategies —
+// regular (sequential), pipelined (greeting+auth+CONNECT in one write), 0-rtt
+// (that write also carries the first application payload), and, with -tfo,
+// 0-rtt+TCP Fast Open (that write carried in the SYN) — by fetching a URL
+// through a SOCKS5 proxy N times each and reporting a per-phase latency
+// breakdown (proxy DNS, TCP connect, SOCKS5 handshake, TLS, server wait, TTFB,
+// TTLB) via net/http/httptrace. For the deferred (0-rtt) modes the handshake
+// folds into the first write, so the SOCKS5 column is ~0 and TTFB/TTLB is the
+// metric to compare.
 package main
 
 import (

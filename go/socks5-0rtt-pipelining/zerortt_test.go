@@ -361,8 +361,11 @@ func TestConnectFailureSurfacedOnRead(t *testing.T) {
 	if rerr == nil {
 		t.Fatal("expected an error on Read after a failed CONNECT, got nil")
 	}
-	if errors.Is(rerr, io.EOF) {
-		t.Logf("Read surfaced failure as EOF (acceptable): %v", rerr)
+	// The failure must be detectable: either a proxy rejection (ErrConnectRejected)
+	// or, depending on timing, the conn closing under us (io.EOF). Both are
+	// surfaced via errors.Is on a wrapped error.
+	if !errors.Is(rerr, ErrConnectRejected) && !errors.Is(rerr, io.EOF) {
+		t.Fatalf("expected ErrConnectRejected or io.EOF, got %v", rerr)
 	}
 }
 

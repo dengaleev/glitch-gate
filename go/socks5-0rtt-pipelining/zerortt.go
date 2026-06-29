@@ -35,6 +35,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"sync"
@@ -49,6 +50,14 @@ import (
 // Outline SDK's Shadowsocks ClientDataWait: longer than any reasonable
 // inter-goroutine handoff, shorter than a real network RTT.
 const DefaultClientDataWait = 10 * time.Millisecond
+
+// ErrConnectRejected is returned, wrapped, when the proxy answers the CONNECT
+// with a non-success reply. Because 0-RTT pipelining sends the first payload
+// before this reply is known, a caller that needs to detect a rejected
+// optimistic send (to decide whether to retry on a fresh connection) can test
+// for it with errors.Is. Handshake-phase failures generally surface as wrapped
+// "zerortt:" errors — use errors.Is rather than == (e.g. errors.Is(err, io.EOF)).
+var ErrConnectRejected = errors.New("zerortt: proxy rejected CONNECT")
 
 // Dialer establishes SOCKS5 CONNECT tunnels that pipeline the first application
 // payload with the handshake (0-RTT data pipelining). The zero value is not
@@ -93,8 +102,10 @@ type Dialer struct {
 // DialerFromURL builds a Dialer from a SOCKS5 proxy URL such as
 // "socks5://user:pass@host:1080" (socks5h:// is also accepted; the destination
 // is always resolved by the proxy regardless). The port defaults to 1080.
-// Credentials, when present, select user/pass auth. The returned Dialer can be
-// further configured (FastOpen, ClientDataWait, NetDialer) before use.
+// User/pass auth is selected only when both a username and a password are
+// present (a username with an empty password connects with no auth). The
+// returned Dialer can be further configured (FastOpen, ClientDataWait,
+// NetDialer) before use.
 func DialerFromURL(rawURL string) (*Dialer, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -175,14 +186,21 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 
 	if d.FastOpen {
 		// Lazy connect: the SOCKS5 handshake + first payload ride in the SYN, so
-		// the actual connect happens on first flush, carrying those bytes.
+		// the actual connect happens on first flush, carrying those bytes. The
+		// caller's dial ctx is canceled by net/http once DialContext returns
+		// (before this connect runs), so the connect is rooted in a fresh,
+		// Conn-lifecycle context that Close cancels and that inherits only the
+		// caller's deadline (not its premature cancellation). NetDialer.Timeout
+		// bounds it too.
 		td := &tfo.Dialer{Dialer: *base, Fallback: true}
+		var connCtx context.Context
+		if dl, ok := ctx.Deadline(); ok {
+			connCtx, c.connCancel = context.WithDeadline(context.Background(), dl)
+		} else {
+			connCtx, c.connCancel = context.WithCancel(context.Background())
+		}
 		c.connect = func(initial []byte) (net.Conn, int, error) {
-			cctx := ctx
-			if cctx.Err() != nil {
-				cctx = context.Background()
-			}
-			conn, err := td.DialContext(cctx, "tcp", d.ProxyAddress, initial)
+			conn, err := td.DialContext(connCtx, "tcp", d.ProxyAddress, initial)
 			if err != nil {
 				return nil, 0, fmt.Errorf("zerortt: fast-open dial proxy %s: %w", d.ProxyAddress, err)
 			}
@@ -205,6 +223,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	c.raw = raw
 	c.connect = func(initial []byte) (net.Conn, int, error) {
 		n, err := raw.Write(initial)
+		if err == nil && n < len(initial) {
+			err = io.ErrShortWrite // a truncated handshake must not look like success
+		}
 		return raw, n, err
 	}
 	return c, nil
@@ -234,6 +255,13 @@ type Conn struct {
 	// initial as SYN data. Set once by Dialer.DialContext.
 	connect func(initial []byte) (net.Conn, int, error)
 
+	// connCancel cancels the FastOpen lazy connect (nil for the eager path).
+	// Set once at construction, so Close can call it without holding wmu to
+	// abort an in-flight SYN-data dial. Idempotent.
+	connCancel func()
+
+	// wmu and rmu are never held simultaneously; their acquisition order is
+	// therefore unconstrained.
 	wmu       sync.Mutex    // serializes writes and guards the one-time flush
 	raw       net.Conn      // live proxy conn; pre-set when eager, nil until flush when FastOpen
 	flushed   bool          // handshake bytes have been written
@@ -258,7 +286,7 @@ func buildHandshake(method byte, user, pass, dst string) ([]byte, error) {
 	if atyp == socks5.ATYPDomain {
 		addr = addr[1:] // ParseAddress length-prefixes the domain; NewRequest re-adds it
 	}
-	var buf bytes.Buffer
+	var buf bytes.Buffer // writes to a bytes.Buffer cannot fail
 	_, _ = socks5.NewNegotiationRequest([]byte{method}).WriteTo(&buf)
 	if method == socks5.MethodUsernamePassword {
 		_, _ = socks5.NewUserPassNegotiationRequest([]byte(user), []byte(pass)).WriteTo(&buf)
@@ -312,6 +340,9 @@ func (c *Conn) flush(early []byte) (int, error) {
 	}
 
 	conn, n, err := c.connect(payload)
+	if c.connCancel != nil {
+		c.connCancel() // connect finished; release the FastOpen connect context
+	}
 	c.raw = conn
 	c.flushErr = err
 	if err != nil {
@@ -360,6 +391,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 	if err := c.ensureReplies(); err != nil {
 		return 0, err
 	}
+	// Safe without wmu: the flush(nil) above synchronized c.raw through wmu.
 	return c.raw.Read(b)
 }
 
@@ -396,14 +428,20 @@ func (c *Conn) readReplies() error {
 		return fmt.Errorf("zerortt: read connect reply: %w", err)
 	}
 	if rep.Rep != socks5.RepSuccess {
-		return fmt.Errorf("zerortt: connect rejected (rep=0x%02x)", rep.Rep)
+		return fmt.Errorf("%w (rep=0x%02x)", ErrConnectRejected, rep.Rep)
 	}
 	return nil
 }
 
-// Close closes the underlying proxy connection. A FastOpen Conn that never
-// reached its first flush has no connection to close and Close is a no-op.
+// Close closes the underlying proxy connection. For a FastOpen Conn it first
+// cancels any in-flight lazy connect (without taking wmu, so it can interrupt a
+// first flush that is blocked dialing); a FastOpen Conn that never reached its
+// first flush then has no connection to close. Calling the underlying Close
+// more than once returns that conn's error on the later calls.
 func (c *Conn) Close() error {
+	if c.connCancel != nil {
+		c.connCancel()
+	}
 	c.wmu.Lock()
 	raw := c.raw
 	c.wmu.Unlock()
