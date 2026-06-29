@@ -151,30 +151,52 @@ target data intact for the next read.
 
 ### Early-data interop across Go SOCKS5 servers
 
-The decisive question is **not** whether a server uses `bufio` — it is *where it
-relays from*. A `bufio`-wrapped handshake is fine **as long as the relay reads
-from that same `bufio.Reader`**. The hazard is the specific combination
-*`bufio` for the handshake + relay from the raw conn/fd*, which strands the
-buffered early bytes. Every server surveyed is safe; the hazard is a pattern to
-watch for in unaudited servers.
+A server is early-data-safe only if **both** hold: it reads the CONNECT request
+without discarding trailing bytes, **and** the client→target relay reads from the
+same stream that consumed the handshake. Two distinct hazards break this:
 
-| Server | Handshake parse | Relay reads from | Early-data |
+- **Over-read** — the request parser bulk-reads into an oversized buffer and
+  drops whatever followed the request. `go-gost/gosocks5`'s `ReadRequest` does
+  `readAtLeast(b[:262], 5)` then discards `b[length:n]`, so a coalesced
+  ClientHello is silently lost (verified: a 39-byte early payload is dropped
+  whole; its `ReadMethods`/`ReadUserPassRequest` *are* exact, only the request
+  read over-reads).
+- **Buffer-then-relay-from-raw** — the handshake is read through a `bufio.Reader`
+  but the relay reads from the raw conn, stranding the buffered bytes.
+  `sagernet/sing` (the sing-box engine) parses via a `*bufio.Reader` then relays
+  from the bare conn via `NewLazyConn(conn)`; its HTTP handler splices the buffer
+  back with `bufio.NewCachedConn`, but its SOCKS handler does not.
+
+The table was re-verified against each library's actual source. A `bufio`-wrapped
+handshake is fine **as long as the relay reads from that same `bufio.Reader`**
+(armon/things-go/haxii do this correctly).
+
+| Server (version) | CONNECT request read | relay reads client from | Early-data |
 | --- | --- | --- | :-: |
-| `txthinking/socks5` | raw `io.ReadFull` | same raw conn | ✅ safe |
-| `wzshiming/socks5` | raw `readByte`/`readBytes` | same raw conn | ✅ safe |
-| `go-gost/gosocks5` | raw `readFull` | same raw conn | ✅ safe |
-| `armon/go-socks5` | `bufio.NewReader` | **same** `bufConn` | ✅ safe |
-| `things-go/go-socks5` | `bufio.NewReader` | **same** `request.Reader` | ✅ safe |
-| Dante / 3proxy / `ssh -D` | exact-length reads | same fd | ✅ safe¹ |
-| *hazard pattern* | `bufio` read-ahead | **raw** conn/fd (≠ handshake reader) | ❌ early bytes lost |
+| `txthinking/socks5` | exact `io.ReadFull`, raw conn | same raw conn | ✅ safe |
+| `wzshiming/socks5` v0.7.0 | exact, no `bufio` | same raw conn | ✅ safe |
+| `armon/go-socks5` | exact, via `bufio` | same `req.bufConn` | ✅ safe |
+| `things-go/go-socks5` v0.1.1 | exact, via `bufio` | same `request.Reader` | ✅ safe |
+| `haxii/socks5` v1.0.0 | exact, via `bufio` | same `req.bufConn` | ✅ safe |
+| `getlantern/go-socks5` | exact, via `bufio` | same `req.BufConn`¹ | ✅ safe¹ |
+| `go-shadowsocks2/socks` v0.1.5 | exact (sized slices) | same raw conn | ✅ safe² |
+| **`go-gost/gosocks5`** v0.5.0 | **bulk `readAtLeast(b[:262],5)`** | same raw conn | ❌ **over-read** |
+| **`sagernet/sing`** v0.8.11 | exact, but via `*bufio.Reader` | **raw conn (`bufio` dropped)** | ❌ **strands bytes** |
 
-¹ Architectural assessment (read each SOCKS message as an exact-length read and
-relay from the same socket), not source-quoted here.
+Client-only libraries (`golang.org/x/net/proxy`, Outline SDK `transport/socks5`)
+have no server, so early-data safety doesn't apply.
 
-Because there is no SOCKS5 capability bit to detect early-data support (unlike
+¹ `getlantern`: safe with the default connect handler; a custom `HandleConnect`
+relaying from the raw conn would strand early data.
+² `go-shadowsocks2`: technically safe, but it's a local front-end (the SOCKS
+client is normally same-host), so early data is of limited relevance.
+
+Because SOCKS5 has no capability bit to detect early-data support (unlike
 [Tor proposal 181](#prior-art)'s version gate or SOCKS6's Initial Data field),
-treat it as best-effort: gate it on a known-good proxy, or be prepared for the
-hazard server to drop the first payload.
+this is best-effort: gate it on a known-good proxy. The two unsafe libraries are
+widely deployed — sing-box (`sing`) and many commercial proxies (GOST) — so a
+real proxy that fails 0-RTT while accepting plain pipelining is the expected
+signature of one of these.
 
 ---
 
