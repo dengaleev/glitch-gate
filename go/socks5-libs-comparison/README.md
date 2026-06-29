@@ -399,10 +399,20 @@ advertises** — exactly the "when we exactly know about authorization" conditio
 | **`golang.org/x/net/proxy`** | **two (user/pass via public API)** | ❌ | hard | `proxy.SOCKS5()` advertises **both** no‑auth and user/pass whenever auth is set, so auth can't be pipelined without a behavior change — in a *frozen, internal* package. Only the no‑auth path is naturally pipelinable. |
 
 > Server‑only libraries (`armon`, `things-go`, `haxii`, `getlantern`) and the
-> client‑less `go-shadowsocks2/socks` have no client handshake to optimize. Note
-> they *interoperate* with a pipelining client fine: each reads messages with
-> `io.ReadFull`/`bufio.Reader` and doesn't discard buffered bytes between phases,
-> so early‑arriving client bytes are consumed correctly.
+> client‑less `go-shadowsocks2/socks` have no client handshake to optimize. They
+> *interoperate* with a handshake‑pipelining client fine: each reads the
+> greeting / auth / CONNECT messages with exact‑length reads, so a coalesced
+> handshake is consumed correctly.
+>
+> **Early *data* pipelining is stricter** (see
+> [`../socks5-0rtt-pipelining`](../socks5-0rtt-pipelining)): appending the first
+> application bytes to the CONNECT also requires the *server* not to over‑read the
+> request into a throwaway buffer, nor to parse via `bufio` and relay from the raw
+> conn. Source‑verified, **`go-gost/gosocks5`** (over‑reads the CONNECT with
+> `readAtLeast(b[:262], 5)` and discards the tail) and **`sagernet/sing`** (parses
+> via `bufio` but relays from the bare conn) are **not** early‑data‑safe; the
+> others surveyed are. The interop matrix in that directory is the authoritative
+> list.
 
 **Best candidates:** the three that **always advertise a single method** —
 `sing` (easiest), `txthinking` (best ROI here, see below), and Outline (already

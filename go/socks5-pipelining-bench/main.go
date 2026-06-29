@@ -1,8 +1,12 @@
-// Command socks5-pipelining-bench compares a regular (sequential) SOCKS5
-// handshake against a pipelined one (greeting + auth + request in a single
-// write) by fetching a URL through a SOCKS5 proxy N times each and reporting a
-// per-phase latency breakdown (proxy DNS, TCP connect, SOCKS5 handshake, TLS,
-// server wait, TTFB, TTLB) using net/http/httptrace.
+// Command socks5-pipelining-bench compares the SOCKS5 tunnel-setup strategies —
+// regular (sequential), pipelined (greeting+auth+CONNECT in one write), 0-rtt
+// (that write also carries the first application payload), and, with -tfo,
+// 0-rtt+TCP Fast Open (that write carried in the SYN) — by fetching a URL
+// through a SOCKS5 proxy N times each and reporting a per-phase latency
+// breakdown (proxy DNS, TCP connect, SOCKS5 handshake, TLS, server wait, TTFB,
+// TTLB) via net/http/httptrace. For the deferred (0-rtt) modes the handshake
+// folds into the first write, so the SOCKS5 column is ~0 and TTFB/TTLB is the
+// metric to compare.
 package main
 
 import (
@@ -26,6 +30,7 @@ func main() {
 	timeout := flag.Duration("timeout", 30*time.Second, "per-request timeout")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification")
 	noWarmup := flag.Bool("no-warmup", false, "skip the (unmeasured) warm-up request")
+	tfo := flag.Bool("tfo", false, "also measure a 0-rtt+TCP Fast Open client (needs OS + proxy TFO support; falls back otherwise)")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -41,8 +46,13 @@ func main() {
 	fmt.Printf("proxy:  %s (auth: %s)\n", px.Redacted(), yesno(auth))
 	fmt.Printf("target: %s\n", *target)
 
+	modes := []mode{modeRegular, modePipelined, modeZeroRTT}
+	if *tfo {
+		modes = append(modes, modeZeroRTTFO)
+	}
+
 	if !*noWarmup {
-		_, body, err := measure(ctx, *target, px, false, *insecure, *timeout)
+		_, body, err := measure(ctx, *target, px, modeRegular, *insecure, *timeout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warm-up request failed: %v\n", err)
 			os.Exit(1)
@@ -53,40 +63,76 @@ func main() {
 	}
 	fmt.Println()
 
-	var reg, pip []result
+	runs := make(map[mode][]result, len(modes))
 	for i := range *n {
-		// Interleave regular/pipelined so neither eats network warm-up bias.
-		if pt, _, err := measure(ctx, *target, px, false, *insecure, *timeout); err != nil {
-			fmt.Fprintf(os.Stderr, "regular run %d failed: %v\n", i+1, err)
-		} else {
-			reg = append(reg, pt.result())
-		}
-		if pt, _, err := measure(ctx, *target, px, true, *insecure, *timeout); err != nil {
-			fmt.Fprintf(os.Stderr, "pipelined run %d failed: %v\n", i+1, err)
-		} else {
-			pip = append(pip, pt.result())
+		// Interleave the modes each iteration so none eats network warm-up bias.
+		for _, m := range modes {
+			pt, _, err := measure(ctx, *target, px, m, *insecure, *timeout)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s run %d failed: %v\n", m, i+1, err)
+				continue
+			}
+			runs[m] = append(runs[m], pt.result())
 		}
 	}
 
-	if len(reg) == 0 || len(pip) == 0 {
-		fmt.Fprintln(os.Stderr, "no successful runs to compare")
+	var summary []namedResult
+	for _, m := range modes {
+		rs := runs[m]
+		if len(rs) == 0 {
+			fmt.Fprintf(os.Stderr, "no successful %s runs\n", m)
+			continue
+		}
+		renderRuns(os.Stdout, fmt.Sprintf("%s (ms)", titleFor(m)), rs)
+		fmt.Println()
+		summary = append(summary, namedResult{m.String(), mean(rs)})
+	}
+
+	if len(summary) < 2 {
+		fmt.Fprintln(os.Stderr, "not enough successful modes to compare")
 		os.Exit(1)
 	}
+	renderComparison(os.Stdout, summary)
 
-	renderRuns(os.Stdout, "Regular — sequential (ms)", reg)
-	fmt.Println()
-	renderRuns(os.Stdout, "Pipelined — one write (ms)", pip)
-	fmt.Println()
-	renderComparison(os.Stdout, mean(reg), mean(pip))
+	// A deferred mode failing wholesale while a baseline mode works is the
+	// signature of a proxy that doesn't forward data sent before the CONNECT
+	// reply — 0-RTT data pipelining is best-effort (no capability handshake).
+	baselineOK := len(runs[modeRegular]) > 0 || len(runs[modePipelined]) > 0
+	deferredAllFailed := false
+	for _, m := range modes {
+		if m.deferred() && len(runs[m]) == 0 {
+			deferredAllFailed = true
+		}
+	}
+	if baselineOK && deferredAllFailed {
+		fmt.Fprintln(os.Stderr, "\nnote: a 0-rtt mode failed on every run while a non-deferred mode succeeded —\n"+
+			"      this proxy likely is not early-data-safe (it doesn't forward bytes sent\n"+
+			"      before the CONNECT reply). See ../socks5-0rtt-pipelining for the interop story.")
+	}
 }
 
-func measure(ctx context.Context, target string, px *url.URL, pipelined, insecure bool, timeout time.Duration) (*phaseTrace, []byte, error) {
+func titleFor(m mode) string {
+	switch m {
+	case modeRegular:
+		return "Regular — sequential"
+	case modePipelined:
+		return "Pipelined — one write"
+	case modeZeroRTT:
+		return "0-RTT — handshake + first payload"
+	case modeZeroRTTFO:
+		return "0-RTT + TCP Fast Open"
+	default:
+		return m.String()
+	}
+}
+
+func measure(ctx context.Context, target string, px *url.URL, m mode, insecure bool, timeout time.Duration) (*phaseTrace, []byte, error) {
 	pt := &phaseTrace{}
 	// Force HTTP/1.1 for clean, comparable trace semantics.
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	tr := &http.Transport{
-		DialContext:       makeDialContext(px, pipelined, pt),
+		DialContext:       makeDialContext(px, m, timeout, pt),
 		DisableKeepAlives: true,
 		Protocols:         protocols,
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: insecure},
@@ -169,7 +215,11 @@ func yesno(b bool) string {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `socks5-pipelining-bench — compare regular vs pipelined SOCKS5 handshakes
+	fmt.Fprint(os.Stderr, `socks5-pipelining-bench — compare SOCKS5 tunnel setup strategies
+
+Measures regular, pipelined, and 0-rtt (and, with -tfo, 0-rtt+TCP Fast Open)
+SOCKS5 CONNECT against a proxy, with a per-phase latency breakdown. The win
+shows up in TTFB/TTLB and scales with the client->proxy RTT.
 
 Usage:
   socks5-pipelining-bench [flags] socks5://[user:pass@]host:port
@@ -177,5 +227,5 @@ Usage:
 Flags:
 `)
 	flag.PrintDefaults()
-	fmt.Fprint(os.Stderr, "\nExample:\n  socks5-pipelining-bench -n 5 socks5://user:pass@127.0.0.1:1080\n")
+	fmt.Fprint(os.Stderr, "\nExample:\n  socks5-pipelining-bench -n 5 -tfo socks5://user:pass@127.0.0.1:1080\n")
 }

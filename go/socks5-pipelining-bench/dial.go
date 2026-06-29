@@ -9,14 +9,44 @@ import (
 	"net/url"
 	"time"
 
+	zerortt "github.com/dengaleev/glitch-gate/go/socks5-0rtt-pipelining"
 	"github.com/txthinking/socks5"
 )
 
-// socks5Handshake does a SOCKS5 CONNECT to target on an already-connected proxy
-// conn. The sequential path is byte-for-byte what socks5.Client.Dial sends; the
-// pipelined path batches greeting+auth+request into one Write, saving 1-2 round
-// trips. Batching is safe only because the client advertises a single auth
-// method, so the reply is predictable and the request never depends on it.
+// mode selects how the SOCKS5 tunnel is brought up before the application
+// (TLS/HTTP) sends its first byte.
+type mode int
+
+const (
+	modeRegular   mode = iota // sequential RFC 1928 handshake
+	modePipelined             // greeting+auth+CONNECT coalesced into one write
+	modeZeroRTT               // 0-RTT data pipelining (handshake + first payload in one write)
+	modeZeroRTTFO             // 0-RTT data pipelining carried in the TCP SYN (TCP Fast Open)
+)
+
+func (m mode) String() string {
+	switch m {
+	case modeRegular:
+		return "regular"
+	case modePipelined:
+		return "pipelined"
+	case modeZeroRTT:
+		return "0-rtt"
+	case modeZeroRTTFO:
+		return "0-rtt+tfo"
+	default:
+		return "?"
+	}
+}
+
+// deferred reports whether the mode folds the handshake into the first write,
+// leaving the per-phase SOCKS5 column ~0 (the cost shows up in TLS/TTFB).
+func (m mode) deferred() bool { return m == modeZeroRTT || m == modeZeroRTTFO }
+
+// socks5Handshake does a SOCKS5 CONNECT on an already-connected proxy conn. The
+// pipelined path batches greeting+auth+request into one write, which is safe
+// only because the client advertises a single auth method — the reply is then
+// predictable and the request never depends on it.
 func socks5Handshake(conn net.Conn, user, pass, target string, pipelined bool) error {
 	method := socks5.MethodNone
 	if user != "" {
@@ -112,9 +142,10 @@ func readReply(conn net.Conn) error {
 	return nil
 }
 
-// makeDialContext returns a DialContext that dials the SOCKS5 proxy, tunnels to
-// target, and records the proxy DNS/TCP/handshake timestamps into pt.
-func makeDialContext(px *url.URL, pipelined bool, pt *phaseTrace) func(context.Context, string, string) (net.Conn, error) {
+// makeDialContext returns a DialContext that brings up the tunnel per mode and
+// records the phase timestamps into pt. The deferred modes don't handshake here
+// (it folds into the first write), so their SOCKS5 phase is ~0 — compare TTFB/TTLB.
+func makeDialContext(px *url.URL, m mode, timeout time.Duration, pt *phaseTrace) func(context.Context, string, string) (net.Conn, error) {
 	user := px.User.Username()
 	pass, _ := px.User.Password()
 	host := px.Hostname()
@@ -133,6 +164,28 @@ func makeDialContext(px *url.URL, pipelined bool, pt *phaseTrace) func(context.C
 		}
 		proxyAddr := net.JoinHostPort(ip, port)
 
+		if m.deferred() {
+			d := &zerortt.Dialer{
+				ProxyAddress: proxyAddr,
+				Username:     user,
+				Password:     pass,
+				FastOpen:     m == modeZeroRTTFO,
+				// A FastOpen Conn dials lazily, after the request's dial ctx may be
+				// canceled, so bound the connect here rather than via a Conn deadline.
+				NetDialer: &net.Dialer{Timeout: timeout},
+			}
+			pt.connStart = time.Now()
+			conn, err := d.DialContext(ctx, "tcp", target)
+			// Eager for 0-rtt, deferred for fast-open; either way the handshake is
+			// deferred, so socksDone == connDone.
+			pt.connDone = time.Now()
+			pt.socksDone = pt.connDone
+			if err != nil {
+				return nil, err
+			}
+			return conn, nil
+		}
+
 		pt.connStart = time.Now()
 		var d net.Dialer
 		conn, err := d.DialContext(ctx, "tcp", proxyAddr)
@@ -140,8 +193,7 @@ func makeDialContext(px *url.URL, pipelined bool, pt *phaseTrace) func(context.C
 		if err != nil {
 			return nil, fmt.Errorf("connect proxy %s: %w", proxyAddr, err)
 		}
-
-		if err := socks5Handshake(conn, user, pass, target, pipelined); err != nil {
+		if err := socks5Handshake(conn, user, pass, target, m == modePipelined); err != nil {
 			_ = conn.Close()
 			return nil, err
 		}

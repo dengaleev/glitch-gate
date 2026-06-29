@@ -1,8 +1,10 @@
 # socks5-pipelining-bench
 
-Fetches a URL through a SOCKS5 proxy and compares a **regular** (sequential)
-SOCKS5 handshake against a **pipelined** one, printing a per-phase latency
-breakdown via `net/http/httptrace`.
+Fetches a URL through a SOCKS5 proxy and compares, side by side, the
+strategies for bringing up the tunnel — **regular** (sequential), **pipelined**
+(handshake in one write), **0-rtt** (handshake + first payload in one write),
+and optionally **0-rtt+tfo** (that write carried in the TCP SYN) — printing a
+per-phase latency breakdown via `net/http/httptrace`.
 
 ## Handshake pipelining
 
@@ -17,10 +19,26 @@ Both handshakes are built from `github.com/txthinking/socks5`'s wire primitives:
 the regular path is byte-for-byte what `socks5.Client.Dial` sends; the pipelined
 path batches the writes.
 
+## 0-RTT data pipelining
+
+Pipelining still waits for the CONNECT reply before the application sends its
+first byte. The **0-rtt** mode goes one step further: it appends that first
+payload (for an `https://` target, the TLS ClientHello) to the same write, sent
+*before* any reply is read, so the proxy forwards it to the target the instant
+the proxy→target connection opens — removing one more client↔proxy round trip.
+The **0-rtt+tfo** mode additionally carries that single write in the TCP SYN
+(TCP Fast Open), removing the proxy TCP-handshake round trip too.
+
+Both 0-rtt modes are provided by the sibling
+[`../socks5-0rtt-pipelining`](../socks5-0rtt-pipelining) package (this module
+imports it via a local `replace`). See its README for the design, the
+early-data interop story, and the replay-safety policy.
+
 ## Usage
 
 ```sh
-go run . socks5://user:pass@proxy-host:1080
+go run . socks5://user:pass@proxy-host:1080          # regular, pipelined, 0-rtt
+go run . -tfo socks5://user:pass@proxy-host:1080     # + 0-rtt+tfo
 ```
 
 ```
@@ -29,10 +47,17 @@ go run . socks5://user:pass@proxy-host:1080
 -timeout dur     per-request timeout (default 30s)
 -insecure        skip TLS certificate verification
 -no-warmup       skip the warm-up request
+-tfo             also measure a 0-rtt+TCP Fast Open client
 ```
 
 The proxy URL is the only argument (`socks5://` or `socks5h://`; port defaults to
-1080). Credentials trigger user/pass auth.
+1080). Credentials trigger user/pass auth. The modes are interleaved each
+iteration so none eats network warm-up bias.
+
+> **TFO prerequisites.** `-tfo` needs OS support on both ends
+> (`net.ipv4.tcp_fastopen`) and a TFO-capable proxy; otherwise it transparently
+> falls back to a normal connection (no SYN-data win). The real benefit also
+> requires a *warm* cookie — the first connection to a proxy always falls back.
 
 ## Metrics (ms)
 
@@ -54,30 +79,41 @@ DNS is the lookup of the **proxy's** hostname (`-` for an IP proxy). The target
 is always handed to the proxy to resolve, so its DNS lands inside SOCKS5, not the
 DNS column — and `socks5h://` therefore behaves the same as `socks5://` here.
 
+**The deferred modes report SOCKS5 ≈ 0.** For `0-rtt` (and `0-rtt+tfo`) the
+handshake is not performed in `DialContext` — it rides along with the first
+application write (the TLS ClientHello) — so its cost folds into the TLS/Wait/TTFB
+measurement rather than the SOCKS5 column. For `0-rtt+tfo` the TCP connect is
+deferred too, so its TCP column is ≈ 0 as well. **TTFB/TTLB is the metric to
+compare across modes;** the per-phase split is informative only within the
+non-deferred (regular/pipelined) modes. The summary line prints each mode's TTFB
+relative to regular.
+
 ## Example
 
-A no-auth proxy over a real ~89 ms link, `-n 10`:
+The `regular`/`pipelined` columns below are a measured run against a real ~89 ms
+link (`-n 10`); the `0-rtt` column is the **expected shape** (the harness here
+has no high-latency proxy to measure, but see the sibling package's in-process
+latency demonstration):
 
 ```
-┌────────────────────────────────────────────────┐
-│ Comparison — averages (ms)                     │
-├────────┬─────────┬───────────┬────────┬────────┤
-│ PHASE  │ REGULAR │ PIPELINED │      Δ │     Δ% │
-├────────┼─────────┼───────────┼────────┼────────┤
-│ DNS    │    3.73 │      4.03 │  +0.30 │  +8.1% │
-│ TCP    │   88.92 │     87.35 │  -1.57 │  -1.8% │
-│ SOCKS5 │  455.07 │    374.70 │ -80.37 │ -17.7% │
-│ TLS    │  198.81 │    200.20 │  +1.39 │  +0.7% │
-│ Wait   │  182.36 │    190.47 │  +8.11 │  +4.4% │
-│ TTFB   │  928.98 │    856.88 │ -72.10 │  -7.8% │
-│ TTLB   │  929.27 │    857.40 │ -71.87 │  -7.7% │
-└────────┴─────────┴───────────┴────────┴────────┘
+┌────────┬─────────┬───────────┬───────┐
+│ PHASE  │ REGULAR │ PIPELINED │ 0-RTT │
+├────────┼─────────┼───────────┼───────┤
+│ TCP    │   88.92 │     87.35 │ ~88   │
+│ SOCKS5 │  455.07 │    374.70 │  0.00 │   ← handshake folded into TLS/Wait
+│ TLS    │  198.81 │    200.20 │ ~288  │   ← now carries ~1 RTT of SOCKS handshake
+│ TTFB   │  928.98 │    856.88 │ ~770  │
+│ TTLB   │  929.27 │    857.40 │ ~771  │
+└────────┴─────────┴───────────┴───────┘
+
+TTFB vs regular:   pipelined -7.8%   0-rtt ~-17%
 ```
 
-Pipelining removes the no-auth greeting round trip: SOCKS5 drops ~1×RTT (~80 ms,
-≈ the TCP figure) and TTFB/TTLB fall by the same amount. DNS/TCP/TLS/Wait are
-untouched by pipelining — with enough samples their deltas converge to ~0. (Per-run
-tables print above this one; a user/pass proxy saves 2 round trips instead of 1.)
+Pipelining removes the no-auth greeting round trip (~1×RTT, ≈ the TCP figure);
+0-rtt removes a *second* round trip — the wait-for-CONNECT-reply-then-send — so
+its TTFB drops by roughly another RTT below pipelined. The SOCKS5 column is 0 for
+0-rtt because the handshake now overlaps the TLS phase; read TTFB/TTLB.
+(Per-run tables print above this one; a user/pass proxy saves an extra round trip.)
 
 ## Caveats
 
