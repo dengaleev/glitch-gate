@@ -39,16 +39,14 @@ func (m mode) String() string {
 	}
 }
 
-// deferred reports whether the mode defers the SOCKS5 handshake into the first
-// application write (so the per-phase SOCKS5 column is ~0 and the handshake
-// cost folds into the TLS/TTFB measurement).
+// deferred reports whether the mode folds the handshake into the first write,
+// leaving the per-phase SOCKS5 column ~0 (the cost shows up in TLS/TTFB).
 func (m mode) deferred() bool { return m == modeZeroRTT || m == modeZeroRTTFO }
 
-// socks5Handshake does a SOCKS5 CONNECT to target on an already-connected proxy
-// conn. The sequential path is byte-for-byte what socks5.Client.Dial sends; the
-// pipelined path batches greeting+auth+request into one Write, saving 1-2 round
-// trips. Batching is safe only because the client advertises a single auth
-// method, so the reply is predictable and the request never depends on it.
+// socks5Handshake does a SOCKS5 CONNECT on an already-connected proxy conn. The
+// pipelined path batches greeting+auth+request into one write, which is safe
+// only because the client advertises a single auth method — the reply is then
+// predictable and the request never depends on it.
 func socks5Handshake(conn net.Conn, user, pass, target string, pipelined bool) error {
 	method := socks5.MethodNone
 	if user != "" {
@@ -144,15 +142,9 @@ func readReply(conn net.Conn) error {
 	return nil
 }
 
-// makeDialContext returns a DialContext that dials the SOCKS5 proxy, tunnels to
-// target per the given mode, and records the proxy DNS/TCP/handshake timestamps
-// into pt. The proxy hostname is resolved once here (timed as DNS) so that for
-// every mode the destination is handed to the proxy to resolve.
-//
-// For the deferred modes (0-rtt, 0-rtt+tfo) the SOCKS5 handshake is not
-// performed here — it rides along with the first application write — so the
-// SOCKS5 phase is ~0 and its cost folds into the TLS/TTFB measurement. That is
-// the whole point, and TTFB/TTLB is the metric to compare across modes.
+// makeDialContext returns a DialContext that brings up the tunnel per mode and
+// records the phase timestamps into pt. The deferred modes don't handshake here
+// (it folds into the first write), so their SOCKS5 phase is ~0 — compare TTFB/TTLB.
 func makeDialContext(px *url.URL, m mode, timeout time.Duration, pt *phaseTrace) func(context.Context, string, string) (net.Conn, error) {
 	user := px.User.Username()
 	pass, _ := px.User.Password()
@@ -178,16 +170,14 @@ func makeDialContext(px *url.URL, m mode, timeout time.Duration, pt *phaseTrace)
 				Username:     user,
 				Password:     pass,
 				FastOpen:     m == modeZeroRTTFO,
-				// Bound the connect explicitly: a FastOpen Conn dials lazily on
-				// first write, after the request's dial context may already be
-				// canceled, so a Conn deadline cannot reach that connect.
+				// A FastOpen Conn dials lazily, after the request's dial ctx may be
+				// canceled, so bound the connect here rather than via a Conn deadline.
 				NetDialer: &net.Dialer{Timeout: timeout},
 			}
 			pt.connStart = time.Now()
 			conn, err := d.DialContext(ctx, "tcp", target)
-			// A non-fast-open dialer connects eagerly here; a fast-open dialer
-			// defers the connect to the first write. Either way the SOCKS5
-			// handshake is deferred, so socksDone == connDone.
+			// Eager for 0-rtt, deferred for fast-open; either way the handshake is
+			// deferred, so socksDone == connDone.
 			pt.connDone = time.Now()
 			pt.socksDone = pt.connDone
 			if err != nil {

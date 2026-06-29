@@ -93,6 +93,22 @@ func main() {
 		os.Exit(1)
 	}
 	renderComparison(os.Stdout, summary)
+
+	// A deferred mode failing wholesale while a baseline mode works is the
+	// signature of a proxy that doesn't forward data sent before the CONNECT
+	// reply — 0-RTT data pipelining is best-effort (no capability handshake).
+	baselineOK := len(runs[modeRegular]) > 0 || len(runs[modePipelined]) > 0
+	deferredAllFailed := false
+	for _, m := range modes {
+		if m.deferred() && len(runs[m]) == 0 {
+			deferredAllFailed = true
+		}
+	}
+	if baselineOK && deferredAllFailed {
+		fmt.Fprintln(os.Stderr, "\nnote: a 0-rtt mode failed on every run while a non-deferred mode succeeded —\n"+
+			"      this proxy likely is not early-data-safe (it doesn't forward bytes sent\n"+
+			"      before the CONNECT reply). See ../socks5-0rtt-pipelining for the interop story.")
+	}
 }
 
 func titleFor(m mode) string {

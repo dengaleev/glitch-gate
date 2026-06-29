@@ -131,10 +131,9 @@ type namedResult struct {
 	r    result
 }
 
-// renderComparison prints one column per mode (averages, ms) and a TTFB headline
-// relative to the first mode. For the deferred modes the SOCKS5 column is ~0
-// (and TCP too, for fast-open) because the handshake — and, for fast-open, the
-// connect — folds into the TLS/TTFB measurement; TTFB/TTLB is the metric to read.
+// renderComparison prints one column per mode (averages, ms) plus a TTFB
+// headline vs the first mode. Deferred modes show SOCKS5 ~0 (and TCP ~0 for
+// fast-open), so read TTFB/TTLB.
 func renderComparison(w io.Writer, named []namedResult) {
 	t := newTable(w, "Comparison — averages (ms)", len(named)+1)
 	header := table.Row{"phase"}

@@ -1,91 +1,80 @@
 package zerortt
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"sync/atomic"
+	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"github.com/txthinking/socks5"
 )
 
-// This file is a self-contained, in-process comparison lab: an echo target, an
-// unmodified txthinking/socks5 proxy, a per-write/per-read latency shim, a
-// round-trip counter, and the three client handshake strategies
-// (sequential / handshake-pipelined / 0-RTT data pipelined). It needs no
-// external proxy, which is what lets the test prove — against a real txthinking
-// server — that 0-RTT early data is delivered to the target.
+// In-process comparison lab: an echo target, an unmodified txthinking proxy, a
+// latency shim, a round-trip counter, and the sequential / pipelined comparison
+// dialers — enough to prove 0-RTT delivery and contrast the strategies without
+// an external proxy.
 
-// LatencyConn adds a fixed one-way delay to every Write (before the bytes hit
-// the wire) and every Read (before the bytes are handed to the caller),
-// simulating a link whose one-way latency is Delay and whose RTT is 2*Delay.
-// Loopback is otherwise ~instant, so wrapping only the client<->proxy socket
-// isolates the client<->proxy RTT (Rcp) that pipelining targets.
-type LatencyConn struct {
+// latencyConn delays each Write and Read by Delay, simulating a link with one-way
+// latency Delay (RTT 2*Delay); wrapping only the client<->proxy socket isolates
+// the RTT that pipelining targets, since loopback is otherwise ~instant.
+type latencyConn struct {
 	net.Conn
 	Delay time.Duration
 }
 
-func (l *LatencyConn) Write(p []byte) (int, error) {
-	if l.Delay > 0 {
-		time.Sleep(l.Delay)
-	}
+func (l *latencyConn) Write(p []byte) (int, error) {
+	time.Sleep(l.Delay)
 	return l.Conn.Write(p)
 }
 
-func (l *LatencyConn) Read(b []byte) (int, error) {
+func (l *latencyConn) Read(b []byte) (int, error) {
 	n, err := l.Conn.Read(b)
-	if l.Delay > 0 {
-		time.Sleep(l.Delay)
-	}
+	time.Sleep(l.Delay)
 	return n, err
 }
 
-// CountingConn records how many Writes and Reads have been issued on the proxy
-// socket. The decisive 0-RTT metric is Reads at the moment the first
-// application byte is written: a true 0-RTT client sends application data
-// having read nothing back from the proxy.
-type CountingConn struct {
+// countingConn counts Writes and Reads on the proxy socket. The decisive 0-RTT
+// signal is zero reads at the moment the first app byte is written.
+type countingConn struct {
 	net.Conn
 	writes atomic.Int64
 	reads  atomic.Int64
 }
 
-func (c *CountingConn) Write(p []byte) (int, error) { c.writes.Add(1); return c.Conn.Write(p) }
-func (c *CountingConn) Read(b []byte) (int, error)  { c.reads.Add(1); return c.Conn.Read(b) }
-func (c *CountingConn) Writes() int                 { return int(c.writes.Load()) }
-func (c *CountingConn) Reads() int                  { return int(c.reads.Load()) }
+func (c *countingConn) Write(p []byte) (int, error) { c.writes.Add(1); return c.Conn.Write(p) }
+func (c *countingConn) Read(b []byte) (int, error)  { c.reads.Add(1); return c.Conn.Read(b) }
 
-// EchoTarget is a TCP server that echoes everything it receives and timestamps
-// the first byte of each connection.
-type EchoTarget struct {
-	Addr     string
+// echoTarget is a TCP server that echoes everything and timestamps each
+// connection's first byte.
+type echoTarget struct {
+	addr     string
 	arrivals chan time.Time
-	ln       net.Listener
 }
 
-// StartEchoTarget starts an echo server on loopback.
-func StartEchoTarget() (*EchoTarget, error) {
+// startEchoTarget starts an echo server on loopback, closed at test end.
+func startEchoTarget(t testing.TB) *echoTarget {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
-	}
-	t := &EchoTarget{Addr: ln.Addr().String(), arrivals: make(chan time.Time, 16), ln: ln}
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	et := &echoTarget{addr: ln.Addr().String(), arrivals: make(chan time.Time, 16)}
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go t.serve(c)
+			go et.serve(c)
 		}
 	}()
-	return t, nil
+	return et
 }
 
-func (t *EchoTarget) serve(c net.Conn) {
+func (et *echoTarget) serve(c net.Conn) {
 	defer c.Close()
 	buf := make([]byte, 32*1024)
 	first := true
@@ -95,7 +84,7 @@ func (t *EchoTarget) serve(c net.Conn) {
 			if first {
 				first = false
 				select {
-				case t.arrivals <- time.Now():
+				case et.arrivals <- time.Now():
 				default:
 				}
 			}
@@ -109,78 +98,57 @@ func (t *EchoTarget) serve(c net.Conn) {
 	}
 }
 
-// FirstByteArrival blocks until the next connection's first byte arrives (or
-// the timeout elapses) and returns its timestamp.
-func (t *EchoTarget) FirstByteArrival(timeout time.Duration) (time.Time, bool) {
+// firstByteArrival returns when the next connection's first byte arrived.
+func (et *echoTarget) firstByteArrival(timeout time.Duration) (time.Time, bool) {
 	select {
-	case ts := <-t.arrivals:
+	case ts := <-et.arrivals:
 		return ts, true
 	case <-time.After(timeout):
 		return time.Time{}, false
 	}
 }
 
-func (t *EchoTarget) Close() error { return t.ln.Close() }
-
-// Proxy is an in-process, unmodified txthinking/socks5 server (DefaultHandle).
-type Proxy struct {
-	Addr   string
-	server *socks5.Server
-}
-
-// StartProxy starts a txthinking SOCKS5 server on loopback. Empty user/pass =>
-// no-auth; both set => user/pass auth. It is the stock DefaultHandle relay — no
-// changes for early data.
-func StartProxy(user, pass string) (*Proxy, error) {
+// startProxy starts a stock txthinking DefaultHandle server on loopback (empty
+// user/pass => no-auth) — unmodified, to prove early data needs no server
+// change. Shut down at test end.
+func startProxy(t testing.TB, user, pass string) string {
+	t.Helper()
 	// Probe a free port, then hand it to txthinking (which binds TCP+UDP on it).
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
-	}
+	require.NoError(t, err)
 	addr := probe.Addr().String()
-	_ = probe.Close()
+	require.NoError(t, probe.Close())
 
 	host, _, _ := net.SplitHostPort(addr)
 	srv, err := socks5.NewClassicServer(addr, host, user, pass, 0, 0)
-	if err != nil {
-		return nil, err
-	}
+	require.NoError(t, err)
 	go func() { _ = srv.ListenAndServe(nil) }()
+	t.Cleanup(func() { _ = srv.Shutdown() })
 
-	// Wait until the listener is accepting before returning.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
+	require.Eventually(t, func() bool {
 		c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil {
 			_ = c.Close()
-			break
 		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("proxy did not come up at %s: %w", addr, err)
-		}
-	}
-	return &Proxy{Addr: addr, server: srv}, nil
+		return err == nil
+	}, 2*time.Second, 20*time.Millisecond, "proxy did not come up at %s", addr)
+	return addr
 }
 
-func (p *Proxy) Close() error { return p.server.Shutdown() }
+// dialFunc creates a fresh proxy socket, used to inject latency/counting shims.
+type dialFunc func() (net.Conn, error)
 
-// DialFunc creates a fresh proxy socket. Used to inject latency/counting.
-type DialFunc func() (net.Conn, error)
-
-// DialSequential performs the classic RFC 1928 sequential handshake (greeting
-// -> reply, [auth -> reply], CONNECT -> reply) and returns the ready tunnel.
-// All round trips complete before the caller writes a single application byte.
-func DialSequential(proxyAddr, user, pass, dst string, dial DialFunc) (net.Conn, error) {
+// dialSequential is the RFC 1928 baseline: every handshake round trip completes
+// before the caller writes a single application byte.
+func dialSequential(proxyAddr, user, pass, dst string, dial dialFunc) (net.Conn, error) {
 	cl, _ := socks5.NewClient(proxyAddr, user, pass, 0, 0)
 	cl.DialTCP = func(network, laddr, raddr string) (net.Conn, error) { return dial() }
 	return cl.Dial("tcp", dst)
 }
 
-// DialPipelined coalesces greeting + [auth] + CONNECT into one write, then
-// reads and validates the replies before returning the ready tunnel — saving
-// the pre-request round trips but still paying one client<->proxy RTT for the
-// replies before the caller may write application data.
-func DialPipelined(proxyAddr, user, pass, dst string, dial DialFunc) (net.Conn, error) {
+// dialPipelined coalesces the handshake into one write but still waits for the
+// replies before the caller may send — the round trip 0-RTT removes.
+func dialPipelined(proxyAddr, user, pass, dst string, dial dialFunc) (net.Conn, error) {
 	method := socks5.MethodNone
 	if user != "" && pass != "" {
 		method = socks5.MethodUsernamePassword
@@ -204,8 +172,8 @@ func DialPipelined(proxyAddr, user, pass, dst string, dial DialFunc) (net.Conn, 
 	return conn, nil
 }
 
-// readHandshakeReplies reads and validates the method / [auth] / CONNECT
-// replies in order, mirroring Conn.readReplies for the comparison path.
+// readHandshakeReplies validates the method/[auth]/CONNECT replies, mirroring
+// Conn.readReplies for the comparison path.
 func readHandshakeReplies(conn net.Conn, method byte) error {
 	nrep, err := socks5.NewNegotiationReplyFrom(conn)
 	if err != nil {
@@ -233,18 +201,14 @@ func readHandshakeReplies(conn net.Conn, method byte) error {
 	return nil
 }
 
-// roundTrip writes payload then reads len(payload) echoed bytes back, returning
-// them — a small helper for the lab's request/response exchange.
-func roundTrip(conn net.Conn, payload []byte) ([]byte, error) {
-	if _, err := conn.Write(payload); err != nil {
-		return nil, err
-	}
+// roundTrip writes payload through conn and asserts it comes back echoed.
+func roundTrip(t testing.TB, conn net.Conn, payload []byte) {
+	t.Helper()
+	_, err := conn.Write(payload)
+	require.NoError(t, err)
 	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(conn, got); err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(got, payload) {
-		return got, fmt.Errorf("echo mismatch: sent %q got %q", payload, got)
-	}
-	return got, nil
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	_, err = io.ReadFull(conn, got)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
 }
