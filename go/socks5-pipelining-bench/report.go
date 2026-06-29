@@ -125,29 +125,51 @@ func renderRuns(w io.Writer, title string, rs []result) {
 	t.Render()
 }
 
-func renderComparison(w io.Writer, reg, pip result) {
-	t := newTable(w, "Comparison — averages (ms)", 5)
-	t.AppendHeader(table.Row{"phase", "regular", "pipelined", "Δ", "Δ%"})
-	row := func(name string, a, b time.Duration, optional bool) {
-		if optional && (a == 0 || b == 0) {
-			t.AppendRow(table.Row{name, "-", "-", "-", "-"})
-			return
-		}
-		delta := b - a
-		pct := 0.0
-		if a != 0 {
-			pct = float64(delta) / float64(a) * 100
-		}
-		t.AppendRow(table.Row{name, ms(a), ms(b),
-			fmt.Sprintf("%+.2f", float64(delta)/float64(time.Millisecond)),
-			fmt.Sprintf("%+.1f%%", pct)})
+// namedResult pairs a mode's display name with its averaged result.
+type namedResult struct {
+	name string
+	r    result
+}
+
+// renderComparison prints one column per mode (averages, ms) and a TTFB headline
+// relative to the first mode. For the deferred modes the SOCKS5 column is ~0
+// (and TCP too, for fast-open) because the handshake — and, for fast-open, the
+// connect — folds into the TLS/TTFB measurement; TTFB/TTLB is the metric to read.
+func renderComparison(w io.Writer, named []namedResult) {
+	t := newTable(w, "Comparison — averages (ms)", len(named)+1)
+	header := table.Row{"phase"}
+	for _, nr := range named {
+		header = append(header, nr.name)
 	}
-	row("DNS", reg.dns, pip.dns, true)
-	row("TCP", reg.tcp, pip.tcp, false)
-	row("SOCKS5", reg.socks, pip.socks, false)
-	row("TLS", reg.tls, pip.tls, true)
-	row("Wait", reg.wait, pip.wait, false)
-	row("TTFB", reg.ttfb, pip.ttfb, false)
-	row("TTLB", reg.ttlb, pip.ttlb, false)
+	t.AppendHeader(header)
+
+	row := func(label string, get func(result) time.Duration, optional bool) {
+		r := table.Row{label}
+		for _, nr := range named {
+			if d := get(nr.r); optional && d == 0 {
+				r = append(r, "-")
+			} else {
+				r = append(r, ms(d))
+			}
+		}
+		t.AppendRow(r)
+	}
+	row("DNS", func(r result) time.Duration { return r.dns }, true)
+	row("TCP", func(r result) time.Duration { return r.tcp }, false)
+	row("SOCKS5", func(r result) time.Duration { return r.socks }, false)
+	row("TLS", func(r result) time.Duration { return r.tls }, true)
+	row("Wait", func(r result) time.Duration { return r.wait }, false)
+	row("TTFB", func(r result) time.Duration { return r.ttfb }, false)
+	row("TTLB", func(r result) time.Duration { return r.ttlb }, false)
 	t.Render()
+
+	// Headline: TTFB change of each later mode vs the first (regular).
+	base := named[0]
+	if base.r.ttfb > 0 && len(named) > 1 {
+		fmt.Fprintf(w, "\nTTFB vs %s:", base.name)
+		for _, nr := range named[1:] {
+			fmt.Fprintf(w, "   %s %+.1f%%", nr.name, float64(nr.r.ttfb-base.r.ttfb)/float64(base.r.ttfb)*100)
+		}
+		fmt.Fprintln(w)
+	}
 }

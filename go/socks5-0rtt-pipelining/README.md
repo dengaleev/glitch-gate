@@ -223,8 +223,11 @@ one buffer.
   triggers the flush. Acceptable for protocols that eventually do one or the
   other; call `Flush()` to commit the handshake explicitly.
 - **Partial-write assumption.** `flush` assumes the proxy conn is all-or-nothing
-  on `Write` (true for `*net.TCPConn`). An injected `dialProxy` conn with
-  short-write semantics could split the handshake mid-stream.
+  on `Write` (true for `*net.TCPConn`, which `NetDialer` produces). A custom conn
+  with short-write semantics could split the handshake mid-stream.
+- **FastOpen lazy connect.** A `FastOpen` `Conn` connects on first I/O, so
+  `LocalAddr`/`RemoteAddr` are nil until then and `Conn` deadlines do not bound
+  the connect (use `NetDialer.Timeout`).
 - **No capability negotiation.** There is no way to detect a hazard server; this
   is best-effort optimistic data.
 
@@ -272,12 +275,15 @@ proxy's `accept()` yields a connection whose first read already contains the ful
 handshake plus the first payload — same server behavior, just delivered in the
 SYN.
 
+This package **implements** it: set `Dialer.FastOpen = true`. Because the SYN
+must carry the first payload (which isn't known until the first Write), a
+FastOpen `Conn` is dialed *lazily* on the first I/O rather than at
+`DialContext` time, then connects with `greeting | [auth] | CONNECT | payload`
+as the SYN data via [`github.com/database64128/tfo-go`](https://pkg.go.dev/github.com/database64128/tfo-go/v2).
+
 - **Go has no stdlib client TFO API** ([golang/go#4842](https://github.com/golang/go/issues/4842)
-  is accepted-but-unplanned for the client). The practical library is
-  [`github.com/database64128/tfo-go`](https://pkg.go.dev/github.com/database64128/tfo-go/v2),
-  whose dial functions take an extra `b []byte` that becomes the SYN data. Splice
-  it in via txthinking's `Client.DialTCP` hook (or this package's `dialProxy`
-  factory).
+  is accepted-but-unplanned for the client), hence the `tfo-go` dependency, whose
+  dial functions take an extra `b []byte` that becomes the SYN data.
 - **Warm cookie required.** The first-ever connection to a proxy IP:port has no
   cookie and falls back to a normal handshake (RFC 7413 §4.2.1) — no 0-RTT on
   the cold connection. Benchmarks must distinguish cold from warm.
@@ -285,13 +291,15 @@ SYN.
   / ~1220 (IPv6). The tiny SOCKS5 handshake (~3–22 B) plus a typical ClientHello
   fits, but a large ClientHello with many extensions can overflow; the remainder
   then follows the handshake normally (still correct).
-- **Middleboxes.** ~6 % of paths drop SYNs carrying data; the kernel retransmits
-  a dataless SYN, so the early bytes must be tolerated arriving post-handshake
-  too. Both ends need TFO enabled at the OS level.
-
-This package does **not** implement TFO; it is documented as the next step and
-the design is TFO-ready (one coalesced first write, server-read logic agnostic
-to whether bytes arrived in the SYN or the first segment).
+- **Middleboxes / fallback.** ~6 % of paths drop SYNs carrying data; the kernel
+  retransmits a dataless SYN, so the early bytes must be tolerated arriving
+  post-handshake too. `tfo-go`'s `Fallback` is enabled, so an OS or proxy without
+  TFO transparently degrades to a normal connection. Both ends need TFO enabled
+  at the OS level (`net.ipv4.tcp_fastopen`) for the real win.
+- **Caveats of lazy connect.** Until the first I/O a FastOpen `Conn` is not yet
+  connected, so `LocalAddr`/`RemoteAddr` report nil and a deadline set on the
+  `Conn` does not reach the connect — bound it with `Dialer.NetDialer.Timeout`
+  instead.
 
 ---
 
@@ -331,9 +339,13 @@ proxy protocols:
 
 | File | What it is |
 | --- | --- |
-| `zerortt.go` | The deferred-handshake `Conn` and `Dial` — the reference implementation. |
-| `lab.go` | Self-contained in-process lab: latency shim, round-trip counter, echo target, an **unmodified** txthinking proxy, and the sequential / handshake-pipelined comparison dialers. |
+| `zerortt.go` | The public API: `Dialer` (with `FastOpen`), `DialContext`/`Dial`, `DialerFromURL`, and the deferred-handshake `Conn`. |
+| `lab_test.go` | Self-contained in-process lab (test-only): latency shim, round-trip counter, echo target, an **unmodified** txthinking proxy, and the sequential / handshake-pipelined comparison dialers. |
 | `zerortt_test.go` | The proof and demonstration (below). |
+
+The public surface is just `Dialer`, `Conn`, `DialerFromURL`, and
+`DefaultClientDataWait`. `Dialer.DialContext` matches
+`golang.org/x/net/proxy.ContextDialer` and `http.Transport.DialContext`.
 
 ### Run it
 
@@ -353,27 +365,31 @@ What the tests establish, all against a **real, unmodified txthinking server**:
 - `TestServerSpeaksFirstFallback` — read-first protocols degrade gracefully.
 - `TestConnectFailureSurfacedOnRead` — the optimism semantics: a failed CONNECT
   surfaces on `Read`.
+- `TestFastOpenDeliversData` — the `FastOpen` path delivers correctly (here via
+  `tfo-go`'s fallback, since the in-process proxy is not a TFO listener).
 - `TestLatencyOrdering` / `TestRoundTripEconomy` — the ordering and round-trip
   economy of the three strategies.
 
 ### Use it
 
 ```go
-conn, err := zerortt.Dial(proxyAddr, user, pass, "example.com:443", nil)
-// conn is a net.Conn. Its first Write coalesces the SOCKS5 handshake with the
+d := &zerortt.Dialer{ProxyAddress: "127.0.0.1:1080"} // + Username/Password, FastOpen, …
+// or: d, _ := zerortt.DialerFromURL("socks5://user:pass@host:1080")
+
+conn, err := d.DialContext(ctx, "tcp", "example.com:443")
+// conn is a net.Conn whose first Write coalesces the SOCKS5 handshake with the
 // payload. Wrap it in crypto/tls — the ClientHello becomes the 0-RTT payload:
 tlsConn := tls.Client(conn, &tls.Config{ServerName: "example.com"})
 ```
 
-Or as an `http.Transport`:
+As an `http.Transport` it is a one-liner (`d.DialContext` has the right shape):
 
 ```go
-tr := &http.Transport{
-    DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
-        return zerortt.Dial(proxyAddr, user, pass, addr, nil)
-    },
-}
+tr := &http.Transport{DialContext: d.DialContext}
 ```
+
+`Dialer` also satisfies `golang.org/x/net/proxy.ContextDialer`, so it drops into
+anything that accepts one.
 
 ---
 

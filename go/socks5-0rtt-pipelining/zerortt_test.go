@@ -12,6 +12,27 @@ import (
 	"time"
 )
 
+// countingDialer returns a *Dialer wired through a CountingConn so a test can
+// inspect how many writes/reads hit the proxy socket, plus an accessor for the
+// CountingConn captured on the most recent dial.
+func countingDialer(proxyAddr, user, pass string) (*Dialer, func() *CountingConn) {
+	var cc *CountingConn
+	d := &Dialer{
+		ProxyAddress: proxyAddr,
+		Username:     user,
+		Password:     pass,
+		dialProxy: func(_ context.Context, network, address string) (net.Conn, error) {
+			raw, err := net.Dial(network, address)
+			if err != nil {
+				return nil, err
+			}
+			cc = &CountingConn{Conn: raw}
+			return cc, nil
+		},
+	}
+	return d, func() *CountingConn { return cc }
+}
+
 // TestEarlyDataReachesTargetNoAuth proves the core claim: against an unmodified
 // txthinking/socks5 server, application bytes appended to the handshake (sent
 // before any reply is read) are delivered to the target and echoed back.
@@ -27,21 +48,13 @@ func TestEarlyDataReachesTargetNoAuth(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	var cc *CountingConn
-	dial := func() (net.Conn, error) {
-		raw, err := net.Dial("tcp", proxy.Addr)
-		if err != nil {
-			return nil, err
-		}
-		cc = &CountingConn{Conn: raw}
-		return cc, nil
-	}
-
-	conn, err := Dial(proxy.Addr, "", "", target.Addr, dial)
+	d, counter := countingDialer(proxy.Addr, "", "")
+	conn, err := d.DialContext(context.Background(), "tcp", target.Addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer conn.Close()
+	cc := counter()
 
 	// No bytes should have touched the proxy yet: the handshake is deferred.
 	if got := cc.Writes(); got != 0 {
@@ -63,10 +76,9 @@ func TestEarlyDataReachesTargetNoAuth(t *testing.T) {
 		t.Fatalf("expected exactly 1 proxy write to carry handshake+data, got %d", w)
 	}
 	if r := cc.Reads(); r != 0 {
-		t.Fatalf("0-RTT violated: read %d bytes-batches from proxy before sending app data, want 0", r)
+		t.Fatalf("0-RTT violated: read %d batches from proxy before sending app data, want 0", r)
 	}
 
-	// And it must actually arrive at the target and echo back intact.
 	got := make([]byte, len(payload))
 	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatal(err)
@@ -96,17 +108,8 @@ func TestEarlyDataReachesTargetUserPass(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	var cc *CountingConn
-	dial := func() (net.Conn, error) {
-		raw, err := net.Dial("tcp", proxy.Addr)
-		if err != nil {
-			return nil, err
-		}
-		cc = &CountingConn{Conn: raw}
-		return cc, nil
-	}
-
-	conn, err := Dial(proxy.Addr, "user", "pass", target.Addr, dial)
+	d, counter := countingDialer(proxy.Addr, "user", "pass")
+	conn, err := d.DialContext(context.Background(), "tcp", target.Addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -116,7 +119,7 @@ func TestEarlyDataReachesTargetUserPass(t *testing.T) {
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if r := cc.Reads(); r != 0 {
+	if r := counter().Reads(); r != 0 {
 		t.Fatalf("0-RTT violated on auth path: %d reads before app data, want 0", r)
 	}
 
@@ -130,7 +133,7 @@ func TestEarlyDataReachesTargetUserPass(t *testing.T) {
 	}
 }
 
-// TestConcurrentReadWriteCoalesces validates the ClientDataWait fix: when a
+// TestConcurrentReadWriteCoalesces validates the ClientDataWait behavior: when a
 // Read is already blocked (as net/http's readLoop is while the writeLoop
 // prepares the request), the first Write must still coalesce its payload into
 // the single handshake write rather than the Read flushing a bare handshake
@@ -147,16 +150,8 @@ func TestConcurrentReadWriteCoalesces(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	var cc *CountingConn
-	dial := func() (net.Conn, error) {
-		raw, err := net.Dial("tcp", proxy.Addr)
-		if err != nil {
-			return nil, err
-		}
-		cc = &CountingConn{Conn: raw}
-		return cc, nil
-	}
-	conn, err := Dial(proxy.Addr, "", "", target.Addr, dial)
+	d, counter := countingDialer(proxy.Addr, "", "")
+	conn, err := d.DialContext(context.Background(), "tcp", target.Addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,8 +178,102 @@ func TestConcurrentReadWriteCoalesces(t *testing.T) {
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("echo mismatch: got %q want %q", got, payload)
 	}
-	if w := cc.Writes(); w != 1 {
+	if w := counter().Writes(); w != 1 {
 		t.Fatalf("coalescing lost under concurrent read/write: %d proxy writes, want 1", w)
+	}
+}
+
+// TestHTTPThroughZeroRTT drives a real net/http request through the dialer,
+// proving it works as a drop-in http.Transport.DialContext and that the HTTP
+// request line+headers ride along as early data.
+func TestHTTPThroughZeroRTT(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Echo", r.URL.Path)
+		_, _ = io.WriteString(w, "ok:"+r.URL.Path)
+	}))
+	defer backend.Close()
+
+	proxy, err := StartProxy("", "")
+	if err != nil {
+		t.Fatalf("start proxy: %v", err)
+	}
+	defer proxy.Close()
+
+	d := &Dialer{ProxyAddress: proxy.Addr}
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	tr := &http.Transport{
+		Protocols:         protocols,
+		DisableKeepAlives: true,
+		DialContext:       d.DialContext,
+	}
+	defer tr.CloseIdleConnections()
+
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	resp, err := client.Get(backend.URL + "/zero-rtt")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %s", resp.Status)
+	}
+	if string(body) != "ok:/zero-rtt" {
+		t.Fatalf("body = %q, want %q", body, "ok:/zero-rtt")
+	}
+	if got := resp.Header.Get("X-Echo"); got != "/zero-rtt" {
+		t.Fatalf("X-Echo = %q", got)
+	}
+}
+
+// TestFastOpenDeliversData exercises the FastOpen code path. The in-process
+// txthinking proxy listens with a plain TCP listener (not a TFO listener), so
+// tfo-go's Fallback path is taken — which still must deliver the handshake and
+// early data correctly. This proves the FastOpen wiring is sound even where
+// true SYN-data fast open is unavailable.
+func TestFastOpenDeliversData(t *testing.T) {
+	target, err := StartEchoTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	proxy, err := StartProxy("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	d := &Dialer{
+		ProxyAddress: proxy.Addr,
+		FastOpen:     true,
+		NetDialer:    &net.Dialer{Timeout: 3 * time.Second},
+	}
+	conn, err := d.DialContext(context.Background(), "tcp", target.Addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Before the first I/O a FastOpen Conn is not yet connected.
+	if conn.LocalAddr() != nil {
+		t.Errorf("expected nil LocalAddr before first I/O, got %v", conn.LocalAddr())
+	}
+
+	payload := []byte("hello-fastopen")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if conn.LocalAddr() == nil {
+		t.Error("expected non-nil LocalAddr after connect")
+	}
+	got := make([]byte, len(payload))
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("echo mismatch: got %q want %q", got, payload)
 	}
 }
 
@@ -193,7 +282,6 @@ func TestConcurrentReadWriteCoalesces(t *testing.T) {
 // The handshake must still flush (degrading to handshake pipelining) so the
 // tunnel opens and the target's unsolicited greeting is delivered.
 func TestServerSpeaksFirstFallback(t *testing.T) {
-	// A "banner" target that speaks first, then echoes.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -220,14 +308,13 @@ func TestServerSpeaksFirstFallback(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	conn, err := Dial(proxy.Addr, "", "", ln.Addr().String(), nil)
+	d := &Dialer{ProxyAddress: proxy.Addr}
+	conn, err := d.DialContext(context.Background(), "tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer conn.Close()
 
-	// Read first — this must flush the handshake (no early data) and validate
-	// the replies, then surface the banner.
 	got := make([]byte, len(banner))
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	if _, err := io.ReadFull(conn, got); err != nil {
@@ -236,8 +323,6 @@ func TestServerSpeaksFirstFallback(t *testing.T) {
 	if !bytes.Equal(got, banner) {
 		t.Fatalf("banner mismatch: got %q want %q", got, banner)
 	}
-
-	// And a subsequent write still works (normal, post-handshake).
 	if _, err := roundTrip(conn, []byte("EHLO")); err != nil {
 		t.Fatalf("post-banner round trip: %v", err)
 	}
@@ -253,7 +338,6 @@ func TestConnectFailureSurfacedOnRead(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	// Reserve a port and close it so the CONNECT is refused.
 	dead, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -261,17 +345,16 @@ func TestConnectFailureSurfacedOnRead(t *testing.T) {
 	deadAddr := dead.Addr().String()
 	_ = dead.Close()
 
-	conn, err := Dial(proxy.Addr, "", "", deadAddr, nil)
+	d := &Dialer{ProxyAddress: proxy.Addr}
+	conn, err := d.DialContext(context.Background(), "tcp", deadAddr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer conn.Close()
 
-	// The optimistic write succeeds at the proxy-socket level...
 	if _, err := conn.Write([]byte("data that will go nowhere")); err != nil {
 		t.Fatalf("optimistic write should not fail at the socket level: %v", err)
 	}
-	// ...but the CONNECT failure surfaces on the first Read.
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 16)
 	_, rerr := conn.Read(buf)
@@ -279,56 +362,48 @@ func TestConnectFailureSurfacedOnRead(t *testing.T) {
 		t.Fatal("expected an error on Read after a failed CONNECT, got nil")
 	}
 	if errors.Is(rerr, io.EOF) {
-		// txthinking replies RepHostUnreachable then closes; depending on
-		// timing the client may see the rejecting reply or an EOF. Either is a
-		// failure surfaced on Read, which is what matters.
 		t.Logf("Read surfaced failure as EOF (acceptable): %v", rerr)
 	}
 }
 
-// TestHTTPThroughZeroRTT drives a real net/http request through the 0-RTT conn,
-// proving it works as a drop-in http.Transport.DialContext and that the HTTP
-// request line+headers ride along as early data (http/1.1 writes the request
-// before reading the response, so the first Write is the request).
-func TestHTTPThroughZeroRTT(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Echo", r.URL.Path)
-		_, _ = io.WriteString(w, "ok:"+r.URL.Path)
-	}))
-	defer backend.Close()
+// TestDialerFromURL covers the URL constructor used by CLI callers.
+func TestDialerFromURL(t *testing.T) {
+	for _, tc := range []struct {
+		url       string
+		wantProxy string
+		wantUser  string
+		wantPass  string
+		wantErr   bool
+	}{
+		{"socks5://127.0.0.1:1080", "127.0.0.1:1080", "", "", false},
+		{"socks5://u:p@proxy.example:9050", "proxy.example:9050", "u", "p", false},
+		{"socks5h://host", "host:1080", "", "", false}, // default port
+		{"http://host:1080", "", "", "", true},         // wrong scheme
+		{"socks5://", "", "", "", true},                // no host
+	} {
+		d, err := DialerFromURL(tc.url)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("DialerFromURL(%q): expected error, got nil", tc.url)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("DialerFromURL(%q): %v", tc.url, err)
+			continue
+		}
+		if d.ProxyAddress != tc.wantProxy || d.Username != tc.wantUser || d.Password != tc.wantPass {
+			t.Errorf("DialerFromURL(%q) = {%q,%q,%q}, want {%q,%q,%q}",
+				tc.url, d.ProxyAddress, d.Username, d.Password, tc.wantProxy, tc.wantUser, tc.wantPass)
+		}
+	}
+}
 
-	proxy, err := StartProxy("", "")
-	if err != nil {
-		t.Fatalf("start proxy: %v", err)
-	}
-	defer proxy.Close()
-
-	protocols := new(http.Protocols)
-	protocols.SetHTTP1(true)
-	tr := &http.Transport{
-		Protocols:         protocols,
-		DisableKeepAlives: true,
-		DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
-			return Dial(proxy.Addr, "", "", addr, nil)
-		},
-	}
-	defer tr.CloseIdleConnections()
-
-	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
-	resp, err := client.Get(backend.URL + "/zero-rtt")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status %s", resp.Status)
-	}
-	if string(body) != "ok:/zero-rtt" {
-		t.Fatalf("body = %q, want %q", body, "ok:/zero-rtt")
-	}
-	if got := resp.Header.Get("X-Echo"); got != "/zero-rtt" {
-		t.Fatalf("X-Echo = %q", got)
+// TestUnsupportedNetwork rejects non-TCP networks with a clear error.
+func TestUnsupportedNetwork(t *testing.T) {
+	d := &Dialer{ProxyAddress: "127.0.0.1:1080"}
+	if _, err := d.DialContext(context.Background(), "udp", "example.com:53"); err == nil {
+		t.Fatal("expected an error for network \"udp\", got nil")
 	}
 }
 
@@ -364,8 +439,7 @@ func TestLatencyOrdering(t *testing.T) {
 	}
 	payload := []byte("PING")
 
-	measure := func(open func() (net.Conn, error), writeFirst bool) time.Duration {
-		// Drain any stale arrival.
+	measure := func(open func() (net.Conn, error)) time.Duration {
 		select {
 		case <-target.arrivals:
 		default:
@@ -383,13 +457,23 @@ func TestLatencyOrdering(t *testing.T) {
 		if !ok {
 			t.Fatal("no arrival at target")
 		}
-		_ = writeFirst
 		return arr.Sub(start)
 	}
 
-	seq := measure(func() (net.Conn, error) { return DialSequential(proxy.Addr, "", "", target.Addr, latencyDial) }, false)
-	pipe := measure(func() (net.Conn, error) { return DialPipelined(proxy.Addr, "", "", target.Addr, latencyDial) }, false)
-	zero := measure(func() (net.Conn, error) { return Dial(proxy.Addr, "", "", target.Addr, latencyDial) }, true)
+	zeroDialer := &Dialer{
+		ProxyAddress: proxy.Addr,
+		dialProxy: func(_ context.Context, network, address string) (net.Conn, error) {
+			raw, err := net.Dial(network, address)
+			if err != nil {
+				return nil, err
+			}
+			return &LatencyConn{Conn: raw, Delay: delay}, nil
+		},
+	}
+
+	seq := measure(func() (net.Conn, error) { return DialSequential(proxy.Addr, "", "", target.Addr, latencyDial) })
+	pipe := measure(func() (net.Conn, error) { return DialPipelined(proxy.Addr, "", "", target.Addr, latencyDial) })
+	zero := measure(func() (net.Conn, error) { return zeroDialer.DialContext(context.Background(), "tcp", target.Addr) })
 
 	t.Logf("first byte at target (Rcp/2=%v): sequential=%v pipelined=%v 0-rtt=%v", delay, seq.Round(time.Millisecond), pipe.Round(time.Millisecond), zero.Round(time.Millisecond))
 
@@ -419,8 +503,6 @@ func TestRoundTripEconomy(t *testing.T) {
 
 	payload := []byte("PING")
 
-	// Sequential and pipelined complete their handshake (incl. reply reads)
-	// before returning, so by the time we write, reads > 0.
 	for _, tc := range []struct {
 		name string
 		dial func(DialFunc) (net.Conn, error)
@@ -453,16 +535,8 @@ func TestRoundTripEconomy(t *testing.T) {
 	}
 
 	// 0-RTT: zero reads before the app byte is on the wire.
-	var cc *CountingConn
-	d := func() (net.Conn, error) {
-		raw, err := net.Dial("tcp", proxy.Addr)
-		if err != nil {
-			return nil, err
-		}
-		cc = &CountingConn{Conn: raw}
-		return cc, nil
-	}
-	conn, err := Dial(proxy.Addr, "", "", target.Addr, d)
+	d, counter := countingDialer(proxy.Addr, "", "")
+	conn, err := d.DialContext(context.Background(), "tcp", target.Addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,12 +544,11 @@ func TestRoundTripEconomy(t *testing.T) {
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatal(err)
 	}
-	if r := cc.Reads(); r != 0 {
+	if r := counter().Reads(); r != 0 {
 		t.Fatalf("0-rtt: expected 0 reads before app data, got %d", r)
 	}
-	t.Logf("%-10s reads before first app byte: %d", "0-rtt", cc.Reads())
+	t.Logf("%-10s reads before first app byte: %d", "0-rtt", counter().Reads())
 
-	// The payload was already written; read the echo back to confirm delivery.
 	got := make([]byte, len(payload))
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := io.ReadFull(conn, got); err != nil {
