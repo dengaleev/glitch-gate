@@ -15,13 +15,17 @@
 #        topo.sh check                  measure the topology itself
 set -eu
 
-PT_RTT=${PT_RTT:-20}  # proxy↔target RTT, ms
+PT_RTT=${PT_RTT:-20} # proxy↔target RTT, ms
 SPIN=${SPIN:-1}
-SERVER=${SERVER:-}    # default: bench proxy -pick
+SERVER=${SERVER:-} # default: bench proxy -pick
 USER_=bench PASS_=bench
 C=10.0.1.1 P=10.0.1.2 PT=10.0.2.1 T=10.0.2.2
 
-at() { ns=$1; shift; ip netns exec "$ns" "$@"; }
+at() {
+	ns=$1
+	shift
+	ip netns exec "$ns" "$@"
+}
 
 for ns in client proxy target; do
 	ip netns add $ns
@@ -60,7 +64,10 @@ fi
 wait_listen() { # NS PORT PID
 	for _ in $(seq 600); do
 		[ -n "$(at $1 ss -Hltn "sport = :$2")" ] && return 0
-		kill -0 $3 2>/dev/null || { echo "topo: listener on :$2 in $1 exited" >&2; exit 1; }
+		kill -0 $3 2>/dev/null || {
+			echo "topo: listener on :$2 in $1 exited" >&2
+			exit 1
+		}
 		sleep 0.1
 	done
 	echo "topo: timed out waiting for :$2 in $1" >&2
@@ -78,20 +85,25 @@ check() {
 	if at client ping -c1 -W1 $T >/dev/null 2>&1; then echo "FAIL: client reaches target"; else echo "ok: client cannot reach target"; fi
 	at client tc qdisc replace dev c0 root netem delay 80ms
 	echo "== ICMP RTT (client↔proxy netem 80 ms, proxy↔target netem $PT_RTT ms, SPIN=$SPIN)"
-	printf 'client→proxy  '; at client ping -qc20 -i0.1 $P | tail -1
-	printf 'proxy→target  '; at proxy ping -qc20 -i0.1 $T | tail -1
-	at proxy socat TCP-LISTEN:9,bind=$P,fork,reuseaddr EXEC:cat & pid=$!
+	printf 'client→proxy  '
+	at client ping -qc20 -i0.1 $P | tail -1
+	printf 'proxy→target  '
+	at proxy ping -qc20 -i0.1 $T | tail -1
+	at proxy socat TCP-LISTEN:9,bind=$P,fork,reuseaddr EXEC:cat &
+	pid=$!
 	wait_listen proxy 9 $pid
 	echo "== TCP client→proxy: kernel RTT estimate of a fresh connection (ss -ti)"
 	(sleep 1 | at client socat - TCP:$P:9 >/dev/null) &
 	sleep 0.5
-	at client ss -Htin dst $P | grep -oE ' (rtt|minrtt|mss):[^ ]*' | tr '\n' ' '; echo
+	at client ss -Htin dst $P | grep -oE ' (rtt|minrtt|mss):[^ ]*' | tr '\n' ' '
+	echo
 	wait $!
 	echo "== 64 KiB request client→proxy, segments seen on p0"
-	head -c 65536 /dev/zero > /tmp/64k
-	at proxy tcpdump -i p0 -nn -q -l "tcp and src $C and dst port 9" > /tmp/dump 2>/dev/null & dump=$!
+	head -c 65536 /dev/zero >/tmp/64k
+	at proxy tcpdump -i p0 -nn -q -l "tcp and src $C and dst port 9" >/tmp/dump 2>/dev/null &
+	dump=$!
 	sleep 1
-	at client socat - TCP:$P:9 < /tmp/64k > /dev/null
+	at client socat - TCP:$P:9 </tmp/64k >/dev/null
 	sleep 0.5
 	kill $dump
 	wait $dump 2>/dev/null || true
@@ -104,9 +116,12 @@ if [ "${1:-}" = check ]; then
 fi
 
 SERVER=${SERVER:-$(bench proxy -pick)}
-at target bench target -listen $T:7 & tpid=$!
-at proxy bench proxy -listen $P:1080 -server "$SERVER" & p0=$!
-at proxy bench proxy -listen $P:1081 -server "$SERVER" -user $USER_ -pass $PASS_ & p1=$!
+at target bench target -listen $T:7 &
+tpid=$!
+at proxy bench proxy -listen $P:1080 -server "$SERVER" &
+p0=$!
+at proxy bench proxy -listen $P:1081 -server "$SERVER" -user $USER_ -pass $PASS_ &
+p1=$!
 wait_listen target 7 $tpid
 wait_listen proxy 1080 $p0
 wait_listen proxy 1081 $p1
