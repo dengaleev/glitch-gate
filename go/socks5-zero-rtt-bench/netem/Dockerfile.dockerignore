@@ -1,0 +1,7 @@
+# For netem/Dockerfile (BuildKit reads <Dockerfile>.dockerignore).
+*
+!go.mod
+!go.sum
+!**/*.go
+**/*_test.go
+!netem/topo.sh

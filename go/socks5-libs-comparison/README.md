@@ -11,7 +11,7 @@ quality & design**, and **performance**.
 > `ASSOCIATE` support is the single most differentiating feature across Go SOCKS5
 > libraries — most don't have it — so it gets extra attention below.
 
-**Snapshot date:** 2026‑06‑28. Star counts, `imported by` numbers, and release
+**Snapshot date:** 2026‑06‑28 (versions and licenses re‑checked 2026‑10‑04). Star counts, `imported by` numbers, and release
 dates drift; treat them as a point‑in‑time snapshot. Figures were gathered from
 GitHub and pkg.go.dev and independently re‑verified (see
 [Methodology](#methodology--sources)).
@@ -27,7 +27,7 @@ GitHub and pkg.go.dev and independently re‑verified (see
 | **Client + server, with UDP**, zero dependencies | **`wzshiming/socks5`** | Both sides do `CONNECT`/`BIND`/`UDP`, `context`‑aware, stdlib‑only, clean API. |
 | **Client + server, with UDP**, battle‑tested | **`txthinking/socks5`** | Powers Brook/Hysteria; strong real‑world UDP. Dated API, 3 deps, no `context`. |
 | **Low‑level protocol primitives** to build your own | **`go-gost/gosocks5`** | Zero‑dep RFC 1928/1929 codecs + handshake; UDP is primitives only. |
-| Embedding in a **large proxy platform** | **`sagernet/sing`** / **Outline SDK** | Toolkit‑grade, high‑throughput, full UDP — but heavy and opinionated. |
+| Embedding in a **large proxy platform** | **`sagernet/sing`** / **Outline SDK** | Toolkit‑grade, high‑throughput, full UDP — but heavy and opinionated; `sing` is **GPL‑3.0**. |
 
 **For this repo's UDP‑over‑SOCKS5 use case:** `txthinking/socks5` (the current
 choice) is a sound, proven option. If you ever want to drop the three external
@@ -82,15 +82,15 @@ The three the request specifically called out are marked ⭐.
 
 | Library | Stars | Forks | `imported by` | Latest release / last commit | Status |
 | --- | ---: | ---: | ---: | --- | --- |
-| `golang.org/x/net/proxy` | ~3,000¹ | ~1,300¹ | **4,740** | `x/net` v0.56.0 (2026‑06‑09); actively maintained | ✅ Active (Go team) |
+| `golang.org/x/net/proxy` | ~3,000¹ | ~1,300¹ | **4,740** | `x/net` v0.59.0 (2026‑09‑08); actively maintained | ✅ Active (Go team) |
 | `armon/go-socks5` | 2,100 | 551 | 423 | last commit 2016‑09‑02; no tags | ⛔ Unmaintained |
 | `things-go/go-socks5` | 597 | 100 | 107 | v0.1.1 (2026‑03‑25) | ✅ Active |
 | `txthinking/socks5` | 782 | 133 | 181 | last commit 2026‑06‑01 (no tags, pseudo‑versions) | ✅ Active (low‑volume) |
 | `go-gost/gosocks5` | 25 | 19 | 68 | v0.5.0; last commit 2026‑05‑21 | ✅ Active (GOST core) |
-| `wzshiming/socks5` | 131 | 31 | 21 | v0.7.0 (2026‑01‑12); last commit 2026‑06‑01 | ✅ Active (solo) |
+| `wzshiming/socks5` | 131 | 31 | 21 | v0.8.0 (2026‑09‑16) | ✅ Active (solo) |
 | `haxii/socks5` | 50 | 22 | 7 | v1.0.0 (2019‑07‑08) | ⛔ Dormant |
 | `getlantern/go-socks5` | 13 | 4 | 6 | last commit 2017‑11‑14; no tags | ⛔ Dead |
-| `sagernet/sing` (socks pkg) | 125² | 96² | 39 | v0.8.11; last commit 2026‑06‑25 | ✅ Active |
+| `sagernet/sing` (socks pkg) | 125² | 96² | 39 | v0.9.6 (2026‑09‑27); **GPL‑3.0** | ✅ Active |
 | Outline SDK `transport/socks5` | 646³ | 180³ | ~0–2⁴ | v0.1.0‑rc1 / v0.0.23; repo push 2026‑06‑23 | ✅ Active (pre‑1.0) |
 | `go-shadowsocks2/socks` | ~4,700³ | 1,488³ | 104 | v0.1.5 (2021‑04‑21); last commit 2024‑10‑20 | 🟡 Maintenance‑mode |
 
@@ -272,7 +272,7 @@ standalone drop‑in** — you adopt sing's abstractions (`M.Socksaddr`, `N.Dial
 `buf.Buffer`, `HandlerEx`, `Authenticator`) and pull in the whole `common/*`
 base, there are no in‑package unit tests, and there's no rules layer (that lives
 in the consuming app). Great if you're building a sing‑style platform; overkill
-otherwise.
+otherwise. **License: GPL‑3.0‑or‑later** — a hard constraint for most library use.
 
 ### Outline SDK `transport/socks5`
 A clean, idiomatic, **client‑only** SOCKS5 transport from Jigsaw/Outline:
@@ -402,12 +402,30 @@ advertises** — exactly the "when we exactly know about authorization" conditio
 > client‑less `go-shadowsocks2/socks` have no client handshake to optimize. Note
 > they *interoperate* with a pipelining client fine: each reads messages with
 > `io.ReadFull`/`bufio.Reader` and doesn't discard buffered bytes between phases,
-> so early‑arriving client bytes are consumed correctly.
+> so early‑arriving client bytes are consumed correctly. **Early data** (payload
+> sent before the CONNECT reply) is another matter: see below.
 
 **Best candidates:** the three that **always advertise a single method** —
 `sing` (easiest), `txthinking` (best ROI here, see below), and Outline (already
 done). `wzshiming` and `x/net/proxy` need a single‑method *behavior change* on
 the user/pass path first, and `x/net` is additionally policy‑frozen.
+
+### Measured (2026‑10‑04, [`socks5-zero-rtt-bench`](../socks5-zero-rtt-bench))
+
+- **Servers:** pipelining (L1) works everywhere. Early data (L2) is **lost** by
+  `sagernet/sing` (parses via `bufio.Reader`, relays from the raw conn —
+  `protocol/socks/handshake.go:222/228`; affects sing‑box inbounds) and by
+  `go-gost/gosocks5`'s `ReadRequest` (reads up to 262 bytes, drops what follows
+  the request — `socks5.go:519`; affects GOST). `armon`, `things-go`,
+  `txthinking`, `wzshiming`, `haxii`, `getlantern` pass.
+- **Clients:** only Outline is L1 (3 RTT incl. TCP vs 4 no‑auth / 5 user/pass for
+  the rest); none sends early data. A reference L1+L2 client takes 2.
+- **Client pitfalls found:** `gosocks5` `ReadReply` over‑reads and drops tunnel
+  bytes and panics on >255‑byte username/domain; `sing` panics on ≥256‑byte
+  username; `x/net` returns `i/o timeout` instead of `context.Canceled` on cancel
+  and its wrapper conn hides `CloseWrite`/splice; `wzshiming` ignores cancel
+  without a deadline; Outline and `gosocks5` bound only the TCP connect with
+  `ctx`; `txthinking` drops auth if the password is empty.
 
 ### Sketch: adding it to `txthinking/socks5` (this repo's lib)
 
@@ -451,7 +469,7 @@ Need a SOCKS5 SERVER?
 ├─ Need UDP?
 │  ├─ Yes → things-go/go-socks5 (maintained) ... or wzshiming/socks5 (also a client)
 │  └─ No  → things-go/go-socks5 (armon is the same design but unmaintained)
-└─ Building a proxy platform / want max throughput → sagernet/sing
+└─ Building a proxy platform / want max throughput → sagernet/sing (GPL‑3.0)
 
 Need a SOCKS5 CLIENT?
 ├─ TCP only, minimal deps → golang.org/x/net/proxy
@@ -489,7 +507,7 @@ pkg.go.dev, and source files) and then **adversarially re‑verified** by a seco
 pass that re‑checked the error‑prone facts: star counts, `imported by` counts,
 maintenance/release status, the UDP `ASSOCIATE` claim, client/server scope, and
 dependency lists. Verified corrections folded into this document include: `x/net`
-latest is **v0.56.0** and the UDP proposal #32790 is **closed/frozen** (not
+latest was **v0.56.0** at the snapshot (v0.59.0 by 2026‑10‑04) and the UDP proposal #32790 is **closed/frozen** (not
 open); Outline's repo shows ~**29 open issues** (the API's `87` includes PRs) and
 its org/module renamed to **OutlineFoundation** / `golang.getoutline.org/sdk`;
 and `go-shadowsocks2`'s `MaxAddrLen` is **259** (not 270). Numbers are a
