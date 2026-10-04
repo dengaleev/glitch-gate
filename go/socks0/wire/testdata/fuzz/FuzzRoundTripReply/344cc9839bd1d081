@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\x01')
+byte('7')
+[]byte("0")
+string("0000000000000000A:0")
+uint16(310)

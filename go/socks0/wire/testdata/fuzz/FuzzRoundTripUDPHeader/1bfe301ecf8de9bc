@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\x00')
+byte('\x03')
+[]byte("0")
+string("[]::")
+uint16(0)

@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('F')
+byte('û')
+[]byte("")
+string("[]::")
+uint16(0)

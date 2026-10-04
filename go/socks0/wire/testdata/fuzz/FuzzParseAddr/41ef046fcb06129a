@@ -1,0 +1,2 @@
+go test fuzz v1
+string("[fe80::1%etl0]:1")

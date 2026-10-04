@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('Y')
+byte('\x03')
+[]byte("0")
+string("[0000:0aa0:aaa0:aaa0]:0")
+uint16(0)
