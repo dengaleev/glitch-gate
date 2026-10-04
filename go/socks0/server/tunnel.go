@@ -20,9 +20,15 @@ type Conn struct {
 func (c *Conn) Read(b []byte) (int, error) {
 	sc := c.sc
 	if !sc.drained.Load() {
-		if n, ok, err := sc.readBuffered(b); ok {
+		buf, ok, err := sc.takeBuffered()
+		if ok {
+			n := copy(b, buf)
+			sc.consumed(n)
 			sc.recv.Add(int64(n))
-			return n, err
+			return n, nil
+		}
+		if err != nil {
+			return 0, err
 		}
 	}
 	n, err := sc.nc.Read(b)
@@ -160,29 +166,7 @@ func (c *Conn) SetDeadline(t time.Time) error      { return c.sc.nc.SetDeadline(
 func (c *Conn) SetReadDeadline(t time.Time) error  { return c.sc.nc.SetReadDeadline(t) }
 func (c *Conn) SetWriteDeadline(t time.Time) error { return c.sc.nc.SetWriteDeadline(t) }
 
-func (sc *serverConn) readBuffered(b []byte) (n int, ok bool, err error) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	switch {
-	case sc.done:
-		return 0, true, net.ErrClosed
-	case sc.handedOff.Load():
-		return 0, false, nil
-	case sc.bufp != nil && sc.r < sc.w:
-		n = copy(b, sc.bufp.in[sc.r:sc.w])
-		if sc.r += n; sc.r == sc.w {
-			sc.releaseLocked()
-		}
-		return n, true, nil
-	case sc.readErr != nil:
-		return 0, true, sc.readErr
-	}
-	sc.releaseLocked()
-	sc.drained.Store(true)
-	return 0, false, nil
-}
-
-// takeBuffered marks the bytes in use until consumed, for a write outside mu.
+// takeBuffered marks the bytes in use until consumed, for a copy or write outside mu.
 func (sc *serverConn) takeBuffered() (b []byte, ok bool, err error) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()

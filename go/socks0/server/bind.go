@@ -75,25 +75,18 @@ func (h *BindHandler) ServeSOCKS(ctx context.Context, r *Request) error {
 func (h *BindHandler) expectedPeers(ctx context.Context, r *Request) ([]netip.Addr, error) {
 	dst := r.Addr
 	if !dst.IsName() {
-		ip := dst.IP().Unmap().WithZone("")
+		ip := dst.IP()
 		if ip.IsUnspecified() {
 			return nil, nil
 		}
-		if err := h.Filter.allow(r, ipNetwork(ip), netip.AddrPortFrom(ip, 0)); err != nil {
+		if err := h.Filter.allowIP(r, ip); err != nil {
 			return nil, err
 		}
 		return []netip.Addr{ip}, nil
 	}
-	ips, _ := net.DefaultResolver.LookupNetIP(ctx, "ip", dst.Name())
-	var want []netip.Addr
-	for _, ip := range ips {
-		ip = ip.Unmap().WithZone("")
-		if h.Filter.allow(r, ipNetwork(ip), netip.AddrPortFrom(ip, 0)) == nil {
-			want = append(want, ip)
-		}
-	}
+	want, _, _ := h.Filter.lookupAllowed(ctx, net.DefaultResolver, r, dst.Name(), 0, ipNetwork, nil)
 	if len(want) == 0 {
-		return nil, &net.DNSError{Err: "no such host", Name: dst.Name(), IsNotFound: true}
+		return nil, notFound(dst.Name())
 	}
 	return want, nil
 }
@@ -101,7 +94,7 @@ func (h *BindHandler) expectedPeers(ctx context.Context, r *Request) ([]netip.Ad
 const defaultAcceptTimeout = 2 * time.Minute
 
 func (h *BindHandler) accept(ctx context.Context, r *Request, ln net.Listener, want []netip.Addr) (net.Conn, error) {
-	if t := cmp.Or(h.AcceptTimeout, defaultAcceptTimeout); t > 0 {
+	if t := orDefault(h.AcceptTimeout, defaultAcceptTimeout); t > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, t)
 		defer cancel()
@@ -150,7 +143,7 @@ func (sc *serverConn) readUntilGone(gone func()) {
 			}
 			sc.w, sc.r = copy(in, in[sc.r:sc.w]), 0
 		}
-		n, err := sc.nc.Read(in[sc.w:])
+		n, err := sc.bufp.read(sc.nc, sc.w)
 		sc.w += n
 		switch {
 		case err == nil:

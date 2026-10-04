@@ -37,8 +37,7 @@ import (
 
 // Server is a SOCKS5 server library under test.
 type Server struct {
-	Name     string
-	UserPass bool // supports RFC 1929 auth
+	Name string
 	// Serve serves on ln until it is closed; an empty user means no auth.
 	Serve func(ln net.Listener, user, pass string) error
 }
@@ -47,7 +46,7 @@ var quietLog = log.New(io.Discard, "", 0)
 
 // All lists every server under test, in report order.
 var All = []Server{
-	{Name: "armon/go-socks5", UserPass: true, Serve: func(ln net.Listener, user, pass string) error {
+	{Name: "armon/go-socks5", Serve: func(ln net.Listener, user, pass string) error {
 		conf := &armon.Config{Logger: quietLog}
 		if user != "" {
 			conf.Credentials = armon.StaticCredentials{user: pass}
@@ -58,14 +57,14 @@ var All = []Server{
 		}
 		return s.Serve(ln)
 	}},
-	{Name: "things-go/go-socks5", UserPass: true, Serve: func(ln net.Listener, user, pass string) error {
+	{Name: "things-go/go-socks5", Serve: func(ln net.Listener, user, pass string) error {
 		opts := []thingsgo.Option{thingsgo.WithLogger(thingsgo.NewLogger(quietLog))}
 		if user != "" {
 			opts = append(opts, thingsgo.WithCredential(thingsgo.StaticCredentials{user: pass}))
 		}
 		return thingsgo.NewServer(opts...).Serve(ln)
 	}},
-	{Name: "txthinking/socks5", UserPass: true, Serve: func(ln net.Listener, user, pass string) error {
+	{Name: "txthinking/socks5", Serve: func(ln net.Listener, user, pass string) error {
 		// ListenAndServe opens its own listeners; this is its accept loop
 		// body on ln, minus logging.
 		s, err := txthinking.NewClassicServer(ln.Addr().String(), "127.0.0.1", user, pass, 0, 0)
@@ -84,14 +83,14 @@ var All = []Server{
 			_ = s.Handle.TCPHandle(s, c.(*net.TCPConn), r)
 		})
 	}},
-	{Name: "wzshiming/socks5", UserPass: true, Serve: func(ln net.Listener, user, pass string) error {
+	{Name: "wzshiming/socks5", Serve: func(ln net.Listener, user, pass string) error {
 		s := wzshiming.NewServer() // nil Logger is silent
 		if user != "" {
 			s.Authentication = wzshiming.UserAuth(user, pass)
 		}
 		return s.Serve(ln)
 	}},
-	{Name: "haxii/socks5", UserPass: true, Serve: func(ln net.Listener, user, pass string) error {
+	{Name: "haxii/socks5", Serve: func(ln net.Listener, user, pass string) error {
 		conf := &haxii.Config{Logger: quietLog}
 		if user != "" {
 			conf.Credentials = haxii.StaticCredentials{user: pass}
@@ -102,7 +101,7 @@ var All = []Server{
 		}
 		return s.Serve(ln)
 	}},
-	{Name: "getlantern/go-socks5", UserPass: true, Serve: func(ln net.Listener, user, pass string) error {
+	{Name: "getlantern/go-socks5", Serve: func(ln net.Listener, user, pass string) error {
 		golog.SetOutputs(io.Discard, io.Discard) // the library's package-level logger
 		conf := &lantern.Config{}
 		if user != "" {
@@ -114,7 +113,7 @@ var All = []Server{
 		}
 		return s.Serve(ln)
 	}},
-	{Name: "sagernet/sing", UserPass: true, Serve: func(ln net.Listener, user, pass string) error {
+	{Name: "sagernet/sing", Serve: func(ln net.Listener, user, pass string) error {
 		var au *auth.Authenticator
 		if user != "" {
 			au = auth.NewAuthenticator([]auth.User{{Username: user, Password: pass}})
@@ -125,7 +124,7 @@ var All = []Server{
 				singRelay{}, nil, 0, M.SocksaddrFromNet(c.RemoteAddr()), nil)
 		})
 	}},
-	{Name: "go-gost/x (gost)", UserPass: true, Serve: func(ln net.Listener, user, pass string) error {
+	{Name: "go-gost/x (gost)", Serve: func(ln net.Listener, user, pass string) error {
 		// GOST's stock socks5 handler: udp on, sniffing off, default
 		// router dialing directly, x/service accept loop.
 		nop := xlogger.Nop()
@@ -146,7 +145,7 @@ var All = []Server{
 		}
 		return xservice.NewService("socks5", gostListener{ln}, h, xservice.LoggerOption(nop)).Serve()
 	}},
-	{Name: "socks0/server", UserPass: true, Serve: func(ln net.Listener, user, pass string) error {
+	{Name: "socks0/server", Serve: func(ln net.Listener, user, pass string) error {
 		// Defaults, except AllowAll: DefaultFilter denies loopback and
 		// private targets, and every bench target is one (127.0.0.1, netem's
 		// 10.0.2.2). A Filter vets the dial only, not the client's bytes.

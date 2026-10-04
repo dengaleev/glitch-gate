@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -9,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/dengaleev/glitch-gate/go/socks0"
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/neterr"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
@@ -97,7 +97,7 @@ func ReplyFor(err error) wire.Reply {
 	if _, ok := errors.AsType[*net.DNSError](err); ok {
 		return wire.ReplyHostUnreachable
 	}
-	if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
+	if neterr.IsTimeout(err) { // context.DeadlineExceeded too
 		return wire.ReplyTTLExpired
 	}
 	return wire.ReplyGeneralFailure
@@ -111,28 +111,6 @@ func upstreamReply(re *socks0.ReplyError) wire.Reply {
 		return wire.ReplyNotAllowed
 	}
 	return wire.ReplyGeneralFailure
-}
-
-func isTimeout(err error) bool {
-	for err != nil {
-		if t, ok := err.(interface{ Timeout() bool }); ok && t.Timeout() {
-			return true
-		}
-		switch u := err.(type) {
-		case interface{ Unwrap() error }:
-			err = u.Unwrap()
-		case interface{ Unwrap() []error }:
-			for _, e := range u.Unwrap() {
-				if isTimeout(e) {
-					return true
-				}
-			}
-			return false
-		default:
-			return false
-		}
-	}
-	return false
 }
 
 type panicError struct {

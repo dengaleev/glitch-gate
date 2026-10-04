@@ -33,16 +33,24 @@ type AuthConn struct{ sc *serverConn }
 // Authenticate's return, when it is zeroed (best effort); kept longer it never shows another
 // conn's bytes. After Authenticate returned it fails with net.ErrClosed.
 func (c *AuthConn) ReadMessage(parse func(b []byte) (n int, err error)) ([]byte, error) {
-	if c.sc != nil && c.sc.authenticating {
-		c.sc.exposed = true
+	if sc := c.live(); sc != nil {
+		sc.exposed = true
 	}
 	return c.readMessage(parse)
 }
 
+// live returns the conn while Authenticate runs, else nil.
+func (c *AuthConn) live() *serverConn {
+	if c.sc != nil && c.sc.authenticating {
+		return c.sc
+	}
+	return nil
+}
+
 // readMessage keeps the buffer poolable: callers must keep no slice of the message.
 func (c *AuthConn) readMessage(parse func(b []byte) (n int, err error)) ([]byte, error) {
-	sc := c.sc
-	if sc == nil || !sc.authenticating {
+	sc := c.live()
+	if sc == nil {
 		return nil, net.ErrClosed
 	}
 	sc.clearLastMsg()
@@ -57,8 +65,8 @@ func (c *AuthConn) readMessage(parse func(b []byte) (n int, err error)) ([]byte,
 // Write queues b, flushing beyond 1 KiB; errors surface at the next flush or ReadMessage. After
 // Authenticate returned it fails with net.ErrClosed.
 func (c *AuthConn) Write(b []byte) (int, error) {
-	sc := c.sc
-	if sc == nil || !sc.authenticating {
+	sc := c.live()
+	if sc == nil {
 		return 0, net.ErrClosed
 	}
 	stage := socks0.StageAuth
@@ -120,11 +128,11 @@ func (a UserPass) Authenticate(ctx context.Context, c *AuthConn) (any, error) {
 	}
 	user, pass, _, _ := wire.ParseUserPass(msg)
 	id, err := a.identify(ctx, c, user, pass)
-	status := statusOK
+	status := statusOK[:] // not a local array: it would escape through Write
 	if err != nil {
-		status = statusFailed
+		status = statusFailed[:]
 	}
-	_, _ = c.Write(status[:])
+	_, _ = c.Write(status)
 	switch {
 	case err == errRejected:
 		return nil, err

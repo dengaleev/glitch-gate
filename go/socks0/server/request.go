@@ -42,14 +42,10 @@ type Request struct {
 // later bytes, never another conn's. L0/L1 clients send nothing before the reply.
 func (r *Request) Early() []byte {
 	sc := r.sc
-	if sc == nil {
+	if !sc.lockLive() {
 		return nil
 	}
-	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	if sc.replied || sc.done || sc.bufp == nil {
-		return nil
-	}
 	b := sc.bufp.in[sc.r:sc.w:sc.w]
 	sc.exposed = sc.exposed || len(b) > 0
 	return b
@@ -60,15 +56,10 @@ func (r *Request) Early() []byte {
 // It may invalidate earlier Early and Peek results. It suits only L2 clients.
 func (r *Request) Peek(ctx context.Context, n int) ([]byte, error) {
 	sc := r.sc
-	if sc == nil {
+	if !sc.lockLive() {
 		return nil, ErrReplied
 	}
-	sc.mu.Lock()
-	bad := sc.replied || sc.done || sc.bufp == nil
 	sc.mu.Unlock()
-	if bad {
-		return nil, ErrReplied
-	}
 	var err error
 	if n = max(n, 0); n > inSize {
 		n, err = inSize, bufio.ErrBufferFull
@@ -85,6 +76,20 @@ func (r *Request) Peek(ctx context.Context, n int) ([]byte, error) {
 		sc.mu.Unlock()
 	}
 	return sc.bufp.in[sc.r:end:end], err
+}
+
+// lockLive locks mu unless a final reply went out or ServeSOCKS returned (or sc is nil); before
+// either, the conn holds its buffer.
+func (sc *serverConn) lockLive() bool {
+	if sc == nil {
+		return false
+	}
+	sc.mu.Lock()
+	if sc.replied || sc.done || sc.bufp == nil {
+		sc.mu.Unlock()
+		return false
+	}
+	return true
 }
 
 // fillCtx: a timeout loses no bytes, so it is not sticky.
@@ -116,18 +121,12 @@ func (sc *serverConn) fillCtx(ctx context.Context, n int) error {
 // success to 0x5A, keeps 0x5A–0x5D and sends anything else as 0x5B. Later calls return ErrReplied.
 func (r *Request) Reply(rep wire.Reply, bound wire.Addr) (*Conn, error) {
 	sc := r.sc
-	if sc == nil {
-		return nil, ErrReplied
-	}
-	sc.mu.Lock()
-	if sc.replied || sc.done {
-		sc.mu.Unlock()
+	if !sc.lockLive() {
 		return nil, ErrReplied
 	}
 	sc.replied = true
 	err := sc.writeReply(rep, bound)
 	ok := err == nil && isSuccess(rep)
-	sc.linger = err == nil && !ok
 	sc.mu.Unlock()
 	sc.s.Trace.replied(sc.ctx, rep, bound, err)
 	switch {
@@ -156,14 +155,14 @@ var errNotBind = errors.New("socks0/server: ReplyListening: not a BIND request")
 // sends the second. Only for CmdBind; ErrReplied if called twice or after Reply.
 func (r *Request) ReplyListening(bound wire.Addr) error {
 	sc := r.sc
-	if sc == nil {
+	switch {
+	case sc == nil:
 		return ErrReplied
-	}
-	if r.Command != wire.CmdBind {
+	case r.Command != wire.CmdBind:
 		return errNotBind
-	}
-	sc.mu.Lock()
-	if sc.replied || sc.done || sc.listening {
+	case !sc.lockLive():
+		return ErrReplied
+	case sc.listening:
 		sc.mu.Unlock()
 		return ErrReplied
 	}

@@ -793,3 +793,54 @@ func isHandshakeErr(err error) bool {
 	_, ok := errors.AsType[*socks0.HandshakeError](err)
 	return ok
 }
+
+// gateReader's Read closes entered, waits for release, then returns s and io.EOF.
+type gateReader struct {
+	s                string
+	entered, release chan struct{}
+}
+
+func (r *gateReader) Read(b []byte) (int, error) {
+	close(r.entered)
+	<-r.release
+	return copy(b, r.s), io.EOF
+}
+
+// A ModeEarly ReadFrom that read its first data while another call claimed the handshake sends
+// the data alone, after the handshake; if the conn was closed meanwhile, it fails.
+func TestEarlyReadFromLosesClaim(t *testing.T) {
+	for _, closeIt := range []bool{false, true} {
+		c, rc := client(t, proxy{}.serve, early())
+		r := &gateReader{s: "b", entered: make(chan struct{}), release: make(chan struct{})}
+		type result struct {
+			n   int64
+			err error
+		}
+		res := make(chan result, 1)
+		go func() { n, err := c.ReadFrom(r); res <- result{n, err} }()
+		<-r.entered
+		if closeIt {
+			c.Close()
+		} else if n, err := c.Write([]byte("a")); n != 1 || err != nil {
+			t.Fatalf("Write = %d, %v", n, err)
+		}
+		close(r.release)
+		got := <-res
+		if closeIt {
+			if !errors.Is(got.err, net.ErrClosed) || got.n != 0 {
+				t.Errorf("ReadFrom after Close = %d, %v", got.n, got.err)
+			}
+			continue
+		}
+		if got.n != 1 || got.err != nil {
+			t.Fatalf("ReadFrom = %d, %v", got.n, got.err)
+		}
+		if s := readN(t, c, 2); s != "ab" {
+			t.Errorf("echo %q", s)
+		}
+		writes, _, _ := rc.snapshot()
+		if all := bytes.Join(writes, nil); !bytes.Equal(all, append(slices.Clip(hsNoAuth), "ab"...)) {
+			t.Errorf("wrote %q", all)
+		}
+	}
+}

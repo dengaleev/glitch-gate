@@ -2,6 +2,7 @@ package socks0_test
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -364,5 +365,63 @@ func TestRequestBind(t *testing.T) {
 	}
 	if _, err := socks0.Request(t.Context(), nil, wire.CmdConnect, mustAddr("0.0.0.0:0"), nil); socks0.KindOf(err) != socks0.KindConfig {
 		t.Errorf("nil conn: %v", err)
+	}
+}
+
+// Listener methods may run concurrently with an Accept that succeeds, also when errors name the
+// proxy by the conn's address, ProxyAddr not parsing.
+func TestListenerConcurrentAccept(t *testing.T) {
+	addr := listen(t, bindProxy{}.serve)
+	d := &socks0.Dialer{ProxyAddr: "proxy", ProxyDial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return new(net.Dialer).DialContext(ctx, network, addr)
+	}}
+	ln, err := d.Listen(t.Context(), "tcp", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	sl := ln.(*socks0.Listener)
+	accepted := make(chan net.Conn, 1)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	accept := func() error { // all but one fail: another Accept is running or done
+		c, err := sl.Accept()
+		if c != nil {
+			accepted <- c
+		}
+		return err
+	}
+	for _, f := range []func() error{func() error { return sl.SetDeadline(time.Time{}) }, accept, accept} {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := f(); err != nil && !errors.Is(err, net.ErrClosed) {
+					t.Errorf("concurrent call: %v", err)
+				}
+			}
+		})
+	}
+	peer, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	var c net.Conn
+	select {
+	case c = <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Error("no Accept returned a conn")
+	}
+	close(stop)
+	wg.Wait()
+	if c != nil {
+		c.Close()
+	}
+	if err := sl.SetDeadline(time.Time{}); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("SetDeadline after Accept = %v", err)
 	}
 }

@@ -377,6 +377,33 @@ func TestSec_UDPMisconfigNoCrash(t *testing.T) {
 	}
 }
 
+// A negative MaxTargets is a config error, as a bad MaxDatagram is, not a relay dropping every
+// datagram; a Mux is validated recursively, and behind a HandlerFunc it fails at request time.
+func TestSec_UDPNegativeMaxTargets(t *testing.T) {
+	bad := &server.AssociateHandler{MaxTargets: -1}
+	for _, tc := range []struct {
+		h      server.Handler
+		script []byte
+	}{
+		{bad, nil},
+		{&server.Mux{Associate: bad}, nil},
+		{&server.Mux{Connect: &server.Mux{Associate: bad}}, nil},
+		{server.HandlerFunc(bad.ServeSOCKS), cat(greeting(0), request(wire.CmdUDPAssociate, "0.0.0.0:0"))},
+	} {
+		s := &server.Server{ErrorLog: quietLog, Handler: tc.h}
+		cli, srv := net.Pipe()
+		go func() { _, _ = io.Copy(io.Discard, cli) }()
+		go func() { _, _ = cli.Write(tc.script) }()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // bounds a regression
+		err := s.ServeConn(ctx, srv)
+		cancel()
+		cli.Close()
+		if he, ok := errors.AsType[*socks0.HandshakeError](err); !ok || he.Stage != socks0.StageConfig || !strings.Contains(err.Error(), "MaxTargets -1") {
+			t.Errorf("%T: %v", tc.h, err)
+		}
+	}
+}
+
 func secCrashChild() {
 	fail := func(format string, a ...any) {
 		fmt.Printf(format+"\n", a...)

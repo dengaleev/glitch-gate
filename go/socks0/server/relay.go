@@ -1,7 +1,6 @@
 package server
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"io"
@@ -28,7 +27,8 @@ type Relayer struct {
 
 // Relay is (&Relayer{}).Relay.
 func Relay(ctx context.Context, client, target net.Conn) (up, down int64, err error) {
-	return new(Relayer).Relay(ctx, client, target)
+	var rl Relayer
+	return rl.Relay(ctx, client, target)
 }
 
 // Relay copies both ways on the caller's goroutine plus one more until both directions end: EOF
@@ -36,11 +36,11 @@ func Relay(ctx context.Context, client, target net.Conn) (up, down int64, err er
 // bytes go first; Linux TCP↔TCP splices. err is nil if both ended in EOF, else the first error.
 // Both conns are closed on return; a panic on the second goroutine is re-raised on the caller's.
 func (rl *Relayer) Relay(ctx context.Context, client, target net.Conn) (up, down int64, err error) {
-	if ut := cmp.Or(rl.UserTimeout, defaultUserTimeout); ut > 0 {
+	if ut := orDefault(rl.UserTimeout, defaultUserTimeout); ut > 0 {
 		setUserTimeout(client, ut)
 		setUserTimeout(target, ut)
 	}
-	st := &relayState{rl: rl, client: client, target: target}
+	st := &relayState{rl: *rl, client: client, target: target}
 	st.upW.Writer, st.upR.Reader, st.downW.Writer, st.downR.Reader = target, client, client, target
 	st.lastMove.Store(time.Now().UnixNano())
 	stop := func() bool { return true }
@@ -75,7 +75,7 @@ var errPanic = errors.New("socks0/server: relay panicked")
 const defaultUserTimeout = 2 * time.Minute
 
 type relayState struct {
-	rl             *Relayer
+	rl             Relayer // a copy: rl does not escape
 	client, target net.Conn
 	lastMove       atomic.Int64 // UnixNano
 	halfCloseAt    atomic.Int64 // UnixNano deadline once one direction ended
@@ -142,20 +142,28 @@ func (st *relayState) copyIdle(dst, src net.Conn) (n int64, err error) {
 	b := copyBufs.Get().(*[]byte)
 	defer copyBufs.Put(b)
 	idle := st.rl.IdleTimeout
-	for {
-		_ = src.SetReadDeadline(st.readDeadline())
+	for arm := true; ; {
+		if arm {
+			_ = src.SetReadDeadline(st.readDeadline())
+		}
 		m, rerr := src.Read(*b)
 		if m > 0 {
-			st.lastMove.Store(time.Now().UnixNano())
-			_ = dst.SetWriteDeadline(time.Now().Add(idle))
+			now := time.Now()
+			st.lastMove.Store(now.UnixNano())
+			_ = dst.SetWriteDeadline(now.Add(idle))
 			w, werr := dst.Write((*b)[:m])
 			n += int64(w)
 			if werr != nil {
 				return n, werr
 			}
 		}
+		// A deadline armed earlier fires early if bytes moved since: otherDirectionMoved re-arms it.
+		// Once half-closed, every read re-arms, as halfCloseAt replaced the idle deadline.
 		switch {
-		case rerr == nil, st.otherDirectionMoved(rerr):
+		case rerr == nil:
+			arm = st.halfCloseAt.Load() != 0
+		case st.otherDirectionMoved(rerr):
+			arm = true
 		case errors.Is(rerr, io.EOF):
 			return n, nil
 		default:

@@ -4,7 +4,10 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"strings"
 	"syscall"
+
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/sockopt"
 )
 
 var (
@@ -56,16 +59,21 @@ func checkRelay(relay, proxy netip.Addr) error {
 	return nil
 }
 
-func (d *Dialer) proxyIP(control net.Conn) netip.Addr {
-	if host, _, err := net.SplitHostPort(d.ProxyAddr); err == nil {
-		if ip, err := netip.ParseAddr(host); err == nil {
-			return ip
-		}
+// proxyHost is ProxyAddr's host and, for a literal (even zoned), its IP,
+// unmapped and zone-free as BND substitution and the relay policy use it.
+type proxyHost struct {
+	name string
+	ip   netip.Addr
+	err  error // ProxyAddr is not host:port
+}
+
+func (d *Dialer) proxyHost() proxyHost {
+	host, _, err := net.SplitHostPort(d.ProxyAddr)
+	var ip netip.Addr
+	if strings.Contains(host, ":") || strings.Trim(host, "0123456789.") == "" {
+		ip, _ = netip.ParseAddr(host) // not for a name: its error allocates
 	}
-	if ta, ok := control.RemoteAddr().(*net.TCPAddr); ok {
-		return ta.AddrPort().Addr()
-	}
-	return netip.Addr{}
+	return proxyHost{host, ip.Unmap().WithZone(""), err}
 }
 
 // relayControl checks the dialed (so also resolved) address and clears
@@ -79,11 +87,6 @@ func relayControl(proxy netip.Addr) func(context.Context, string, string, syscal
 		if err := checkRelay(ap.Addr(), proxy); err != nil {
 			return err
 		}
-		return noBroadcast(c)
+		return sockopt.NoBroadcast(c)
 	}
-}
-
-func listenNoBroadcast(ctx context.Context, network, address string) (net.PacketConn, error) {
-	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error { return noBroadcast(c) }}
-	return lc.ListenPacket(ctx, network, address)
 }

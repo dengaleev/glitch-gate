@@ -25,9 +25,9 @@ import (
 
 const usage = `bench — SOCKS5 zero-RTT readiness benchmark
 
-  bench ready  [-v]                      server L1/L2 checks (in-process)
+  bench ready  [-v] [-pick FILE]         server L1/L2 checks (in-process)
   bench target -listen ADDR              TCP echo target
-  bench proxy  -listen ADDR [-server NAME] [-user U -pass P] [-pick]
+  bench proxy  -listen ADDR [-server NAME] [-user U -pass P]
   bench rtt    -proxy HOST -target ADDR [-n 30] [-c 8] [-rtts 0,20,80,200]
                [-show 80] [-dev IFACE] [-user U -pass P] [-payload 64]
 
@@ -49,6 +49,7 @@ func main() {
 func ready(args []string) error {
 	fs := flag.NewFlagSet("ready", flag.ExitOnError)
 	verbose := fs.Bool("v", false, "print every failure, not just one detail per failed cell")
+	pick := fs.String("pick", "", "also write the default proxy server's name (see bench proxy -server) to this file")
 	_ = fs.Parse(args)
 
 	reps := checkAll(context.Background())
@@ -57,7 +58,14 @@ func ready(args []string) error {
 		allocs[i] = fmtAllocs(servers.Allocs(s))
 	}
 	renderReady(os.Stdout, reps, allocs, *verbose)
-	return nil
+	if *pick == "" {
+		return nil
+	}
+	s, err := defaultServer(reps)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(*pick, []byte(s.Name+"\n"), 0o644)
 }
 
 func checkAll(ctx context.Context) []servers.Report {
@@ -88,19 +96,11 @@ func proxy(args []string) error {
 	name := fs.String("server", "", "server implementation (default: the first that passes every readiness check)")
 	user := fs.String("user", "", "require this username (empty: no auth)")
 	pass := fs.String("pass", "", "password for -user")
-	pick := fs.Bool("pick", false, "print the default server's name and exit")
 	_ = fs.Parse(args)
 
 	s, err := pickServer(*name)
 	if err != nil {
 		return err
-	}
-	if *pick {
-		fmt.Println(s.Name)
-		return nil
-	}
-	if *user != "" && !s.UserPass {
-		return fmt.Errorf("server %q does not support user/pass auth", s.Name)
 	}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -110,21 +110,26 @@ func proxy(args []string) error {
 	return s.Serve(ln, *user, *pass)
 }
 
-// pickServer returns the named server or, by default, the first user/pass
-// one that passes every readiness cell, so L2 clients get a proxy that keeps
-// early data.
+// pickServer returns the named server or, by default, defaultServer.
 func pickServer(name string) (servers.Server, error) {
-	if name != "" {
-		for _, s := range servers.All {
-			if strings.EqualFold(s.Name, name) {
-				return s, nil
-			}
-		}
-		return servers.Server{}, fmt.Errorf("unknown server %q (have: %s)", name, serverNames())
+	if name == "" {
+		return defaultServer(checkAll(context.Background()))
 	}
-	for i, r := range checkAll(context.Background()) {
-		if s := servers.All[i]; s.UserPass && passesAll(r) {
+	for _, s := range servers.All {
+		if strings.EqualFold(s.Name, name) {
 			return s, nil
+		}
+	}
+	return servers.Server{}, fmt.Errorf("unknown server %q (have: %s)", name, serverNames())
+}
+
+// defaultServer returns the first server whose report (reps[i], from
+// checkAll) passes every readiness cell, so L2 clients get a proxy that
+// keeps early data.
+func defaultServer(reps []servers.Report) (servers.Server, error) {
+	for i, r := range reps {
+		if passesAll(r) {
+			return servers.All[i], nil
 		}
 	}
 	return servers.Server{}, errors.New("no server passes every readiness check; choose one with -server")

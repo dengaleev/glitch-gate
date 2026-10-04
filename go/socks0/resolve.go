@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strconv"
 
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/neterr"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
@@ -31,7 +33,7 @@ func (d *Dialer) LookupNetIP(ctx context.Context, network, host string) ([]netip
 	}
 	var target wire.Addr
 	if err == nil {
-		target, err = wire.ParseAddr(net.JoinHostPort(host, "0"))
+		target, err = nameAddr(host, 0)
 	}
 	bound, err := d.lookup(ctx, opResolve, wire.CmdTorResolve, host, target, err)
 	if err != nil {
@@ -69,14 +71,14 @@ func (d *Dialer) lookup(ctx context.Context, op string, cmd wire.Command, name s
 	_, err = d.newConn(&ctx, c, op, "tcp", cmd, target, err)
 	if err == nil {
 		var conn net.Conn
-		if conn, _, err = d.connect(ctx, c); err == nil {
+		if conn, err = d.connect(ctx, c); err == nil {
 			conn.Close()
 			return c.h.bound, nil
 		}
 	}
 	re, ok := errors.AsType[*ReplyError](err)
 	e := &net.DNSError{Err: errors.Unwrap(err).Error(), Name: name, Server: d.server(), UnwrapErr: err,
-		IsNotFound: ok && re.Reply == wire.ReplyHostUnreachable, IsTimeout: isTimeout(err)}
+		IsNotFound: ok && re.Reply == wire.ReplyHostUnreachable, IsTimeout: neterr.IsTimeout(err)}
 	if e.IsNotFound {
 		e.Err = errNoSuchHost
 	}
@@ -85,6 +87,11 @@ func (d *Dialer) lookup(ctx context.Context, op string, cmd wire.Command, name s
 }
 
 const errNoSuchHost = "no such host" // as net's
+
+// nameAddr is host and port as a wire.Addr (a name unless host is an IP).
+func nameAddr(host string, port uint16) (wire.Addr, error) {
+	return wire.ParseAddr(net.JoinHostPort(host, strconv.Itoa(int(port))))
+}
 
 func (d *Dialer) notFound(name string) error {
 	return &net.DNSError{Err: errNoSuchHost, Name: name, Server: d.server(), IsNotFound: true}

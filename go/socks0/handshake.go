@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/neterr"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
@@ -27,28 +28,26 @@ const maxReplyBytes = 64 << 10
 // handshake holds no inline buffers, so a Dialer's L0/L1 handshake can live on
 // the stack; out and rbuf share one allocation.
 type handshake struct {
-	mode         Mode
-	version      uint8 // 4 or 5
-	cmd          wire.Command
-	userID       string        // SOCKS4
-	auth         Authenticator // nil offers MethodNoAuth
-	pipe         Pipeliner     // auth, if it is one
-	offered      wire.Method
-	offerNoAuth  bool // besides offered
-	method       wire.Method
-	authReqStage string
-	authRepStage string
-	authLen      int // of the auth request
-	authMin      int // shortest auth reply, read ahead with the method selection
-	userPass     bool
-	username     string
-	password     string
-	authRequest  []byte // a non-UserPass Pipeliner's
-	buf          []byte // out, then rbuf
-	out          []byte // greeting, auth request (not in ModeSequential), request
-	greetingEnd  int    // in out
-	authEnd      int    // in out
-	target       wire.Addr
+	mode        Mode
+	version     uint8 // 4 or 5
+	cmd         wire.Command
+	userID      string        // SOCKS4
+	auth        Authenticator // nil offers MethodNoAuth
+	pipe        Pipeliner     // auth, if it is one
+	offered     wire.Method
+	offerNoAuth bool // besides offered
+	method      wire.Method
+	authLen     int // of the auth request
+	authMin     int // shortest auth reply, read ahead with the method selection
+	userPass    bool
+	username    string
+	password    string
+	authRequest []byte // a non-UserPass Pipeliner's
+	buf         []byte // out, then rbuf
+	out         []byte // greeting, auth request (not in ModeSequential), request
+	greetingEnd int    // in out
+	authEnd     int    // in out
+	target      wire.Addr
 
 	readStage string
 	mu        *sync.Mutex // if set, held to write readStage, which other Conn calls read
@@ -85,7 +84,7 @@ func (h *handshake) init5(cfg *Config) error {
 	if cfg.OfferNoAuth && h.mode != ModeSequential {
 		return errOfferNoAuth
 	}
-	h.offered, h.authReqStage, h.authRepStage = wire.MethodNoAuth, StageAuth, StageAuth
+	h.offered = wire.MethodNoAuth
 	if cfg.Auth == nil {
 		return nil
 	}
@@ -99,14 +98,12 @@ func (h *handshake) init5(cfg *Config) error {
 }
 
 func (h *handshake) setAuth(a Authenticator, offerNoAuth bool) error {
-	switch up := a.(type) {
-	case *UserPass:
-		if up == nil {
-			return errNilUserPass
-		}
-		h.setUserPass(*up)
-	case UserPass:
-		h.setUserPass(up)
+	up, ok, err := asUserPass(a)
+	if err != nil {
+		return err
+	}
+	if ok {
+		h.userPass, h.username, h.password = true, up.Username, up.Password
 	}
 	if h.offered = a.Method(); h.offered == wire.MethodNoAcceptable {
 		return errNoAcceptable
@@ -119,9 +116,32 @@ func (h *handshake) setAuth(a Authenticator, offerNoAuth bool) error {
 	return nil
 }
 
-func (h *handshake) setUserPass(up UserPass) {
-	h.userPass, h.username, h.password = true, up.Username, up.Password
-	h.authReqStage, h.authRepStage = wire.StageUserPass, wire.StageUserPassStatus
+// asUserPass returns a's UserPass, if it is one.
+func asUserPass(a Authenticator) (_ UserPass, ok bool, _ error) {
+	switch a := a.(type) {
+	case *UserPass:
+		if a == nil {
+			return UserPass{}, false, errNilUserPass
+		}
+		return *a, true, nil
+	case UserPass:
+		return a, true, nil
+	}
+	return UserPass{}, false, nil
+}
+
+func (h *handshake) authReqStage() string {
+	if h.userPass {
+		return wire.StageUserPass
+	}
+	return StageAuth
+}
+
+func (h *handshake) authRepStage() string {
+	if h.userPass {
+		return wire.StageUserPassStatus
+	}
+	return StageAuth
 }
 
 func (h *handshake) preparePipelined() error {
@@ -147,21 +167,17 @@ func (h *handshake) init4(auth Authenticator) error {
 	if h.cmd != wire.CmdConnect && h.cmd != wire.CmdBind {
 		return fmt.Errorf("socks0: SOCKS4 has no %v: %w", h.cmd, errors.ErrUnsupported)
 	}
-	switch a := auth.(type) {
-	case nil:
-	case *UserPass:
-		if a == nil {
-			return errNilUserPass
-		}
-		return h.init4(*a)
-	case UserPass:
-		if a.Password != "" {
-			return errAuthSOCKS4
-		}
-		h.userID = a.Username
-	default:
+	if auth == nil {
+		return nil
+	}
+	up, ok, err := asUserPass(auth)
+	switch {
+	case err != nil:
+		return err
+	case !ok || up.Password != "":
 		return errAuthSOCKS4
 	}
+	h.userID = up.Username
 	return nil
 }
 
@@ -231,22 +247,22 @@ func (h *handshake) writeStage(n int) string {
 	case n < h.greetingEnd:
 		return wire.StageGreeting
 	case n < h.authEnd:
-		return h.authReqStage
+		return h.authReqStage()
 	}
 	return wire.StageRequest
 }
 
-func (h *handshake) run(ctx context.Context, conn net.Conn, tr tracer) (wrote bool, he *HandshakeError) {
+func (h *handshake) run(ctx context.Context, conn net.Conn, tr *ClientTrace) *HandshakeError {
 	if h.mode == ModeSequential && h.version == 5 {
-		return true, h.runSequential(ctx, conn, tr)
+		return h.runSequential(ctx, conn, tr)
 	}
 	n, err := firstWrite(conn, h.out)
 	h.wipe(nil)
 	tr.wroteHandshake(err)
 	if err != nil {
-		return true, &HandshakeError{h.writeStage(n), err}
+		return &HandshakeError{h.writeStage(n), err}
 	}
-	return true, h.readReplies(conn, tr)
+	return h.readReplies(conn, tr)
 }
 
 // wipe zeroes written credentials in out and in b, a copy (best effort).
@@ -260,7 +276,7 @@ func (h *handshake) wipe(b []byte) {
 	clear(h.authRequest)
 }
 
-func (h *handshake) runSequential(ctx context.Context, conn net.Conn, tr tracer) *HandshakeError {
+func (h *handshake) runSequential(ctx context.Context, conn net.Conn, tr *ClientTrace) *HandshakeError {
 	_, err := firstWrite(conn, h.out[:h.greetingEnd])
 	tr.wroteHandshake(err)
 	if err != nil {
@@ -280,18 +296,18 @@ func (h *handshake) runSequential(ctx context.Context, conn net.Conn, tr tracer)
 	return h.readReply(conn, tr)
 }
 
-func (h *handshake) authenticate(ctx context.Context, conn net.Conn, tr tracer) *HandshakeError {
+func (h *handshake) authenticate(ctx context.Context, conn net.Conn, tr *ClientTrace) *HandshakeError {
 	rw := &countingWriter{ReadWriter: conn}
 	err := h.auth.Authenticate(ctx, rw)
 	tr.authDone(err)
 	if err == nil {
 		return nil
 	}
-	stage := h.authRepStage
+	stage := h.authRepStage()
 	if pe, ok := errors.AsType[*ProtocolError](err); ok {
 		stage = pe.Stage
 	} else if rw.n < h.authLen {
-		stage = h.authReqStage
+		stage = h.authReqStage()
 	}
 	return &HandshakeError{stage, err}
 }
@@ -307,19 +323,16 @@ func (w *countingWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
-func (h *handshake) readReplies(r io.Reader, tr tracer) *HandshakeError {
+func (h *handshake) readReplies(r io.Reader, tr *ClientTrace) *HandshakeError {
 	if h.version == 4 {
 		return h.readReply(r, tr)
 	}
-	ahead := 5 // the shortest reply is longer
-	if h.pipe != nil {
-		ahead += h.authMin
-	}
-	if he := h.readMethod(r, ahead, tr); he != nil {
+	// The shortest reply is longer than 5; authMin is 0 without a Pipeliner.
+	if he := h.readMethod(r, 5+h.authMin, tr); he != nil {
 		return he
 	}
 	if h.pipe != nil {
-		err := h.readNext(r, h.authRepStage, 5, h.pipe.ParseReply)
+		err := h.readNext(r, h.authRepStage(), 5, h.pipe.ParseReply)
 		tr.authDone(err)
 		if err != nil {
 			return h.fail(err)
@@ -328,7 +341,7 @@ func (h *handshake) readReplies(r io.Reader, tr tracer) *HandshakeError {
 	return h.readReply(r, tr)
 }
 
-func (h *handshake) readMethod(r io.Reader, ahead int, tr tracer) *HandshakeError {
+func (h *handshake) readMethod(r io.Reader, ahead int, tr *ClientTrace) *HandshakeError {
 	var m wire.Method
 	err := h.readNext(r, wire.StageMethodSelection, ahead, func(b []byte) (n int, err error) {
 		m, n, err = wire.ParseMethodSelection(b)
@@ -344,7 +357,7 @@ func (h *handshake) readMethod(r io.Reader, ahead int, tr tracer) *HandshakeErro
 	return nil
 }
 
-func (h *handshake) readReply(r io.Reader, tr tracer) *HandshakeError {
+func (h *handshake) readReply(r io.Reader, tr *ClientTrace) *HandshakeError {
 	rep, bound, err := h.nextReply(r)
 	if _, ok := err.(*ReplyError); ok || err == nil {
 		tr.gotReply(rep, bound)
@@ -424,10 +437,7 @@ func (h *handshake) readNext(r io.Reader, stage string, ahead int, parse func([]
 			return err
 		}
 		if h.readErr != nil {
-			if errors.Is(h.readErr, io.EOF) || errors.Is(h.readErr, io.ErrUnexpectedEOF) {
-				return &ProtocolError{Stage: stage, Err: io.ErrUnexpectedEOF}
-			}
-			return h.readErr
+			return neterr.Truncated(stage, h.readErr)
 		}
 		need := h.msgStart + max(n, len(b)+1) + ahead
 		if need > len(h.rbuf) {

@@ -6,28 +6,12 @@ import (
 	"errors"
 	"slices"
 	"syscall"
-
-	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
 var (
 	errMsgSize     error = syscall.EMSGSIZE
 	errDestAddrReq error = syscall.EDESTADDRREQ
 )
-
-func (e *ReplyError) isErrno(target error) bool {
-	switch e.Reply {
-	case wire.ReplyNetworkUnreachable:
-		return target == syscall.ENETUNREACH
-	case wire.ReplyHostUnreachable:
-		return target == syscall.EHOSTUNREACH
-	case wire.ReplyConnectionRefused:
-		return target == syscall.ECONNREFUSED
-	case wire.ReplyTTLExpired:
-		return target == syscall.ETIMEDOUT
-	}
-	return false
-}
 
 func errnoKind(err error) Kind {
 	is := func(errnos ...syscall.Errno) bool {

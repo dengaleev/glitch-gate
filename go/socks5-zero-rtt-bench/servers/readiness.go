@@ -86,11 +86,8 @@ func (k kase) String() string {
 	return fmt.Sprintf("%s %s %s %dB %s", Columns[k.col], auth, k.host, k.size, splits[k.split].name)
 }
 
-func matrix(userPass bool) []kase {
-	auths := [][2]string{{"", ""}}
-	if userPass {
-		auths = append(auths, [2]string{"user", "pass"})
-	}
+func matrix() []kase {
+	auths := [][2]string{{"", ""}, {"user", "pass"}}
 	hosts := []string{"127.0.0.1", "localhost"}
 	if hasIPv6() {
 		hosts = append(hosts, "::1")
@@ -130,13 +127,11 @@ func newMessage(user, pass, target string, early []byte) (message, error) {
 	}
 	parts = append(parts, req)
 	fields = append(fields, 1, 1, 1, 1) // VER CMD RSV ATYP
-	switch atyp := req[3]; atyp {
-	case 1:
-		fields = append(fields, net.IPv4len)
-	case 4:
-		fields = append(fields, net.IPv6len)
-	default: // domain
-		fields = append(fields, 1, int(req[4]))
+	addrLen, _ := s5.AddrLen(req[3], req[4])
+	if req[3] == s5.AtypDomain {
+		fields = append(fields, 1, addrLen-1) // length byte, name
+	} else {
+		fields = append(fields, addrLen)
 	}
 	fields = append(fields, 2) // port
 	if len(early) > 0 {
@@ -447,7 +442,7 @@ func verify(early, got []byte, err error) error {
 
 // Check runs the readiness matrix against s, in-process on loopback.
 func Check(ctx context.Context, s Server) Report {
-	ks := matrix(s.UserPass)
+	ks := matrix()
 	errs := runCases(ctx, s, ks)
 
 	rep := Report{Server: s.Name, Cells: make([]Cell, len(Columns))}

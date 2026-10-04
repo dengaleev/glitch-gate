@@ -56,7 +56,7 @@ func TestOwnHost(t *testing.T) {
 		{"[2001:db8::8]:80", false},
 		{"8.8.8.8:53", false},
 	} {
-		dst := ap(tc.dst)
+		dst := normalize(ap(tc.dst)) // as ownHost's callers pass it
 		got := ownHost(dst)
 		if tc.self && got != dst || !tc.self && got.IsValid() {
 			t.Errorf("ownHost(%v) = %v, self %v", dst, got, tc.self)
@@ -138,5 +138,40 @@ func TestFilterSelfConcurrent(t *testing.T) {
 		if err := f.checkOwnHost(r, "tcp", dst, dst, nil); err != nil {
 			t.Error(err)
 		}
+	}
+}
+
+// While a refresh holds hostMu, an expired listing is returned at once; with none cached yet, the
+// caller waits for the refresh.
+func TestOwnHostStaleWhileRefreshing(t *testing.T) {
+	calls := 0
+	setHost(t, func() ([]net.Addr, error) {
+		calls++
+		return []net.Addr{&net.IPNet{IP: net.ParseIP("192.0.2.7").To4(), Mask: net.CIDRMask(32, 32)}}, nil
+	}, time.Nanosecond)
+
+	hostMu.Lock() // a refresh in progress, nothing cached
+	got := make(chan *hostAddrs)
+	go func() { got <- currentHostAddrs() }()
+	select {
+	case <-got:
+		t.Fatal("returned without a listing")
+	case <-time.After(10 * time.Millisecond):
+	}
+	hostMu.Unlock()
+	h := <-got
+	if _, ok := h.ips[netip.MustParseAddr("192.0.2.7")]; !ok || calls != 1 {
+		t.Fatalf("listing %v after %d calls", h.ips, calls)
+	}
+
+	time.Sleep(time.Millisecond) // expired
+	hostMu.Lock()
+	stale := currentHostAddrs()
+	hostMu.Unlock()
+	if stale != h || calls != 1 {
+		t.Errorf("a refresh in progress blocked or replaced the expired listing (%d calls)", calls)
+	}
+	if currentHostAddrs() == h || calls != 2 {
+		t.Errorf("not refreshed (%d calls)", calls)
 	}
 }

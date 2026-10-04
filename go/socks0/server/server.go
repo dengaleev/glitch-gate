@@ -121,8 +121,7 @@ type Server struct {
 	cfgErr error
 
 	mu          sync.Mutex
-	inShutdown  bool
-	done        chan struct{} // closed by Shutdown and Close
+	done        chan struct{} // closed by Shutdown and Close, under mu
 	listeners   map[*net.Listener]struct{}
 	conns       map[*serverConn]struct{}
 	onShutdown  []func()
@@ -173,11 +172,11 @@ func (s *Server) configure() error {
 	if c.handler == nil {
 		c.handler = &Mux{Connect: &ConnectHandler{}}
 	}
-	if err := validateHandler(c.handler); err != nil {
+	if err := validate(c.handler); err != nil {
 		return err
 	}
-	c.handshakeTimeout = max(cmp.Or(s.HandshakeTimeout, defaultHandshakeTimeout), 0)
-	c.maxHandshakes = max(int64(cmp.Or(s.MaxHandshakes, defaultMaxHandshakes)), 0)
+	c.handshakeTimeout = orDefault(s.HandshakeTimeout, defaultHandshakeTimeout)
+	c.maxHandshakes = int64(orDefault(s.MaxHandshakes, defaultMaxHandshakes))
 	c.selfAddrs, err = selfPrefixes(s.SelfAddrs)
 	return err
 }
@@ -223,24 +222,17 @@ func selfPrefixes(addrs []netip.Prefix) ([]netip.Prefix, error) {
 	return self, nil
 }
 
-func validateHandler(h Handler) error {
-	if m, ok := h.(*Mux); ok && m != nil {
-		for _, e := range [...]Handler{m.Connect, m.Bind, m.Associate, m.Resolve} {
-			if err := validateBuiltin(e); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	return validateBuiltin(h)
-}
-
-func validateBuiltin(h Handler) error {
-	if a, ok := h.(*AssociateHandler); ok {
-		return a.validate()
+// validate checks a built-in handler's config (a *Mux's entries too); behind another Handler the
+// built-in checks itself per request.
+func validate(h Handler) error {
+	if v, ok := h.(interface{ validate() error }); ok {
+		return v.validate()
 	}
 	return nil
 }
+
+// orDefault: zero means def, negative none (0).
+func orDefault[T ~int | ~int64](v, def T) T { return max(cmp.Or(v, def), 0) }
 
 func (c *config) choose(offered []wire.Method) Authenticator {
 	for _, a := range c.auth {
@@ -337,7 +329,7 @@ func (s *Server) waitSlot() error {
 	s.mu.Lock()
 	for {
 		switch {
-		case s.inShutdown:
+		case closed(s.done):
 			s.mu.Unlock()
 			return ErrServerClosed
 		case s.MaxConns <= 0 || s.slotsUsed < s.MaxConns:
@@ -422,8 +414,7 @@ func (s *Server) Close() error {
 func (s *Server) stop(runHooks bool) error {
 	_ = s.init()
 	s.mu.Lock()
-	if !s.inShutdown {
-		s.inShutdown = true
+	if !closed(s.done) {
 		close(s.done)
 		if runHooks {
 			for _, f := range s.onShutdown {
@@ -466,15 +457,22 @@ func (s *Server) RegisterOnShutdown(f func()) {
 
 func (s *Server) shuttingDown() bool {
 	_ = s.init()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inShutdown
+	return closed(s.done)
+}
+
+func closed(c <-chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) addListener(ln *net.Listener) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.inShutdown {
+	if closed(s.done) {
 		return false
 	}
 	s.listeners[ln] = struct{}{}
@@ -494,7 +492,7 @@ func (s *Server) newConn(ctx context.Context, c net.Conn, slotTaken bool) *serve
 	sc.req.sc, sc.conn.sc, sc.auth.sc = sc, sc, sc
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.inShutdown {
+	if closed(s.done) {
 		if slotTaken {
 			s.slotsUsed--
 		}

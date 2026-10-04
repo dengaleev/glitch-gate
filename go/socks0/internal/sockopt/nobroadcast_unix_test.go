@@ -1,6 +1,6 @@
 //go:build unix
 
-package server
+package sockopt
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// S5: unlike Go's default UDP socket, the target socket cannot broadcast.
+// Unlike Go's default UDP socket, the socket cannot broadcast.
 func TestNoBroadcast(t *testing.T) {
 	opt := func(pc net.PacketConn) int {
 		rc, err := pc.(*net.UDPConn).SyscallConn()
@@ -25,13 +25,13 @@ func TestNoBroadcast(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plain.Close()
-	pc, err := listenTarget(context.Background(), "udp4", "127.0.0.1:0")
+	pc, err := ListenNoBroadcast(context.Background(), "udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer pc.Close()
 	if opt(plain) == 0 || opt(pc) != 0 {
-		t.Fatalf("SO_BROADCAST: Go default %d, target socket %d", opt(plain), opt(pc))
+		t.Fatalf("SO_BROADCAST: Go default %d, no-broadcast socket %d", opt(plain), opt(pc))
 	}
 	if _, err := pc.WriteTo([]byte("x"), &net.UDPAddr{IP: net.IPv4bcast, Port: 9}); err == nil {
 		t.Fatal("broadcast sent")

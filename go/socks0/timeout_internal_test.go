@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/neterr"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
@@ -131,7 +132,7 @@ func TestConnHandshakeTimeoutTimer(t *testing.T) {
 	go func() { done <- c.HandshakeContext(context.Background()) }()
 	select {
 	case err := <-done:
-		if errors.Is(err, context.DeadlineExceeded) || !isTimeout(err) {
+		if errors.Is(err, context.DeadlineExceeded) || !neterr.IsTimeout(err) {
 			t.Errorf("wrapped conn's deadline: %v", err)
 		}
 	case <-time.After(5 * time.Second):

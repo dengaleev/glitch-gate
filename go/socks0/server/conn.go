@@ -7,13 +7,14 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"runtime"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/dengaleev/glitch-gate/go/socks0"
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/neterr"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
@@ -31,6 +32,8 @@ type buffers struct {
 	in      [inSize]byte
 	out     [outSize]byte
 	methods [255]wire.Method
+
+	inUsed, outUsed int // high-water marks: putBuffers clears only up to them
 }
 
 var bufPool = sync.Pool{New: func() any { return new(buffers) }}
@@ -39,11 +42,23 @@ func getBuffers() *buffers { return bufPool.Get().(*buffers) }
 
 func putBuffers(b *buffers) {
 	if b != nil {
-		clear(b.in[:])
-		clear(b.out[:])
+		clear(b.in[:b.inUsed])
+		clear(b.out[:b.outUsed])
+		b.inUsed, b.outUsed = 0, 0
 		bufPool.Put(b)
 	}
 }
+
+// read reads into in[off:]; every write to in goes through it. r must write only the n bytes it
+// returns (as net.Conns do), not use the rest as scratch.
+func (b *buffers) read(r io.Reader, off int) (int, error) {
+	n, err := r.Read(b.in[off:])
+	b.inUsed = min(max(b.inUsed, off+n), inSize)
+	return n, err
+}
+
+// wrote records out, which aliases b.out unless it outgrew it; every write to out goes through it.
+func (b *buffers) wrote(out []byte) { b.outUsed = max(b.outUsed, min(len(out), outSize)) }
 
 var (
 	zeroBound    = wire.AddrFromAddrPort(netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
@@ -71,7 +86,7 @@ type serverConn struct {
 	deadline       time.Time // of the handshake
 	authenticating bool
 	lastMsg        [2]int // the last AuthConn message's bounds in bufp.in
-	linger         bool   // a failure reply or status went out (S1)
+	linger         bool   // a failure reply or status went out (S1): set by writeReply, replyNow and rejections
 	exposed        bool   // see buffers; guarded by mu after the handshake
 
 	mu        sync.Mutex // guards the fields below and bufp after the handshake
@@ -146,10 +161,8 @@ func (sc *serverConn) activate() bool {
 }
 
 func (sc *serverConn) recovered(p any) error {
-	buf := make([]byte, 64<<10)
-	buf = buf[:runtime.Stack(buf, false)]
 	v := fmt.Sprintf("%q", fmt.Sprint(p))
-	sc.s.logf("socks0/server: panic serving %v: %s\n%s", sc.nc.RemoteAddr(), v, buf)
+	sc.s.logf("socks0/server: panic serving %v: %s\n%s", sc.nc.RemoteAddr(), v, debug.Stack())
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	return &panicError{value: v, replied: sc.replied}
@@ -177,9 +190,7 @@ func (sc *serverConn) finish(r *Request, err error) error {
 }
 
 func (sc *serverConn) fallbackReply(err error) bool {
-	sc.mu.Lock()
-	if sc.replied || sc.done {
-		sc.mu.Unlock()
+	if !sc.lockLive() {
 		return false
 	}
 	sc.replied = true
@@ -188,7 +199,6 @@ func (sc *serverConn) fallbackReply(err error) bool {
 		rep = wire.ReplyGeneralFailure
 	}
 	werr := sc.writeReply(rep, wire.Addr{})
-	sc.linger = werr == nil
 	sc.mu.Unlock()
 	sc.s.Trace.replied(sc.ctx, rep, wire.Addr{}, werr)
 	return true
@@ -227,7 +237,7 @@ func (sc *serverConn) lingerClose(b *buffers) {
 	}
 	_ = sc.nc.SetReadDeadline(time.Now().Add(lingerTime))
 	for n := 0; n < lingerMaxBytes; {
-		m, err := sc.nc.Read(b.in[:])
+		m, err := b.read(sc.nc, 0)
 		if n += m; err != nil {
 			return
 		}
@@ -274,7 +284,7 @@ func (sc *serverConn) beginHandshake() {
 
 func (sc *serverConn) negotiate() (string, error) {
 	if err := sc.fill(1); err != nil {
-		return wire.StageGreeting, truncated(wire.StageGreeting, err)
+		return wire.StageGreeting, neterr.Truncated(wire.StageGreeting, err)
 	}
 	versions := sc.s.cfg.versions
 	switch v := sc.bufp.in[0]; {
@@ -434,6 +444,7 @@ func (sc *serverConn) authenticate(a Authenticator) (any, error) {
 }
 
 func (sc *serverConn) queue(out []byte, stage string) {
+	sc.bufp.wrote(out)
 	sc.out, sc.outStage = out, stage
 }
 
@@ -442,7 +453,7 @@ func (sc *serverConn) replyNow(rep wire.Reply) {
 	out, _ := sc.appendReply(sc.out, rep, wire.Addr{})
 	sc.queue(out, wire.StageReply)
 	err := sc.flush()
-	sc.linger = err == nil
+	sc.linger = err == nil && !isSuccess(rep)
 	sc.s.Trace.replied(sc.ctx, rep, wire.Addr{}, err)
 }
 
@@ -465,7 +476,7 @@ func (sc *serverConn) next(stage string, limit int, parse func([]byte) (int, err
 			return nil, &wire.ProtocolError{Stage: stage, Err: errTooLong}
 		}
 		if err := sc.fill(n); err != nil && sc.w-sc.r == len(b) {
-			return nil, truncated(stage, err)
+			return nil, neterr.Truncated(stage, err)
 		}
 	}
 }
@@ -483,7 +494,7 @@ func (sc *serverConn) fill(need int) error {
 		if sc.r+need > len(in) {
 			sc.w, sc.r = copy(in, in[sc.r:sc.w]), 0
 		}
-		n, err := sc.nc.Read(in[sc.w:])
+		n, err := sc.bufp.read(sc.nc, sc.w)
 		sc.w += n
 		sc.readErr = err
 	}
@@ -506,13 +517,6 @@ func (sc *serverConn) clearLastMsg() {
 	sc.lastMsg = [2]int{}
 }
 
-func truncated(stage string, err error) error {
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return &wire.ProtocolError{Stage: stage, Err: io.ErrUnexpectedEOF}
-	}
-	return err
-}
-
 // writeReply: sc.mu is held, or the handshake goroutine owns the conn.
 func (sc *serverConn) writeReply(rep wire.Reply, bound wire.Addr) error {
 	if sc.bufp == nil {
@@ -522,10 +526,12 @@ func (sc *serverConn) writeReply(rep wire.Reply, bound wire.Addr) error {
 	if err != nil {
 		return err
 	}
+	sc.bufp.wrote(out)
 	if t := sc.s.cfg.handshakeTimeout; t > 0 {
 		_ = sc.nc.SetWriteDeadline(time.Now().Add(t))
 	}
 	_, err = sc.nc.Write(out)
+	sc.linger = err == nil && !isSuccess(rep)
 	return err
 }
 

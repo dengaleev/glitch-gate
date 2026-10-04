@@ -17,7 +17,7 @@ set -eu
 
 PT_RTT=${PT_RTT:-20} # proxy↔target RTT, ms
 SPIN=${SPIN:-1}
-SERVER=${SERVER:-} # proxy name(s), comma-separated; default: bench proxy -pick
+SERVER=${SERVER:-} # proxy name(s), comma-separated; default: bench ready -pick
 USER_=bench PASS_=bench
 C=10.0.1.1 P=10.0.1.2 PT=10.0.2.1 T=10.0.2.2
 
@@ -115,13 +115,17 @@ if [ "${1:-}" = check ]; then
 	exit 0
 fi
 
-# SERVER: one proxy name, or several separated by commas: one clients table each.
-SERVER=${SERVER:-$(bench proxy -pick)}
 at target bench target -listen $T:7 &
 tpid=$!
 wait_listen target 7 $tpid
 
-bench ready
+# SERVER: one proxy name, or several separated by commas: one clients table each.
+if [ -n "$SERVER" ]; then
+	bench ready
+else
+	bench ready -pick /tmp/server
+	SERVER=$(cat /tmp/server)
+fi
 rest=$SERVER,
 while [ -n "$rest" ]; do
 	srv=${rest%%,*} rest=${rest#*,}

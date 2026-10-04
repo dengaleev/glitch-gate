@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -10,13 +9,14 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/dengaleev/glitch-gate/go/socks0"
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/neterr"
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/sockopt"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
@@ -49,14 +49,18 @@ type AssociateHandler struct {
 
 	IdleTimeout time.Duration // no datagram relayed either way → end; zero means 5 min, negative none; dropped datagrams do not count
 	MaxDatagram int           // whole datagram incl. header, both ways; zero means 4096 + wire.MaxUDPHeaderLen; larger ones dropped; negative or 1–22 (under the IPv6 header) is a config error
-	MaxTargets  int           // distinct target IP:ports and names per association; zero means 1024; beyond, dropped
+	MaxTargets  int           // distinct target IP:ports and names per association; zero means 1024; beyond, dropped; negative is a config error
 }
 
 const minDatagram = headroom + 1
 
 func (h *AssociateHandler) validate() error {
-	if h != nil && (h.MaxDatagram < 0 || h.MaxDatagram > 0 && h.MaxDatagram < minDatagram) {
+	switch {
+	case h == nil:
+	case h.MaxDatagram < 0 || h.MaxDatagram > 0 && h.MaxDatagram < minDatagram:
 		return fmt.Errorf("socks0/server: AssociateHandler.MaxDatagram %d: negative or under %d", h.MaxDatagram, minDatagram)
+	case h.MaxTargets < 0:
+		return fmt.Errorf("socks0/server: AssociateHandler.MaxTargets %d: negative", h.MaxTargets)
 	}
 	return nil
 }
@@ -81,7 +85,7 @@ const (
 
 // ServeSOCKS replies 07 to other commands.
 func (h *AssociateHandler) ServeSOCKS(ctx context.Context, r *Request) error {
-	if r.Command != wire.CmdUDPAssociate || r.Version != V5 {
+	if r.Command != wire.CmdUDPAssociate { // not a SOCKS4 command
 		return notSupported(r)
 	}
 	if err := h.validate(); err != nil { // behind a Handler the Server cannot see
@@ -105,7 +109,7 @@ func (h *AssociateHandler) listen(ctx context.Context, r *Request) (client, targ
 	if err != nil {
 		return nil, nil, err
 	}
-	target, err = listenOr(h.ListenTarget, listenTarget)(ctx, "udp", ":0")
+	target, err = listenOr(h.ListenTarget, sockopt.ListenNoBroadcast)(ctx, "udp", ":0")
 	if err != nil {
 		client.Close()
 		return nil, nil, err
@@ -117,9 +121,9 @@ func (h *AssociateHandler) newAssociation(ctx context.Context, r *Request, clien
 	a := &association{
 		ctx: ctx, r: r, trace: r.sc.s.Trace, filter: h.Filter, filtering: h.Filtering,
 		resolver: h.Resolver, client: client, target: target,
-		maxDatagram: min(cmp.Or(h.MaxDatagram, defaultMaxDatagram), headroom+65535),
-		maxTargets:  cmp.Or(h.MaxTargets, defaultMaxTargets),
-		idle:        cmp.Or(h.IdleTimeout, defaultUDPIdle),
+		maxDatagram: min(orDefault(h.MaxDatagram, defaultMaxDatagram), headroom+65535),
+		maxTargets:  orDefault(h.MaxTargets, defaultMaxTargets),
+		idle:        orDefault(h.IdleTimeout, defaultUDPIdle),
 		clientIP:    ipOf(r.RemoteAddr),
 		targets:     make(map[netip.AddrPort]error),
 		ips:         make(map[netip.Addr]struct{}),
@@ -128,7 +132,7 @@ func (h *AssociateHandler) newAssociation(ctx context.Context, r *Request, clien
 	if a.resolver == nil {
 		a.resolver = net.DefaultResolver
 	}
-	if ip := r.Addr.IP().Unmap(); ip.IsValid() && (ip == a.clientIP || ip.IsUnspecified()) {
+	if ip := r.Addr.IP(); ip.IsValid() && (ip == a.clientIP || ip.IsUnspecified()) {
 		a.clientPort.Store(uint32(r.Addr.Port())) // 0: the first datagram locks it
 	}
 	a.lastMove.Store(time.Now().UnixNano())
@@ -144,11 +148,6 @@ func listenOr(f, def func(context.Context, string, string) (net.PacketConn, erro
 
 func listenUDP(ctx context.Context, network, address string) (net.PacketConn, error) {
 	return new(net.ListenConfig).ListenPacket(ctx, network, address)
-}
-
-func listenTarget(ctx context.Context, network, address string) (net.PacketConn, error) {
-	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error { return noBroadcast(c) }}
-	return lc.ListenPacket(ctx, network, address)
 }
 
 func advertised(custom func(*Request, netip.AddrPort) wire.Addr, r *Request, ap netip.AddrPort) wire.Addr {
@@ -231,9 +230,7 @@ func (a *association) recover(c *Conn) {
 		return
 	}
 	a.panicked.Store(true)
-	buf := make([]byte, 64<<10)
-	buf = buf[:runtime.Stack(buf, false)]
-	a.r.sc.s.logf("socks0/server: panic in UDP relay for %v: %q\n%s", a.r.RemoteAddr, fmt.Sprint(p), buf)
+	a.r.sc.s.logf("socks0/server: panic in UDP relay for %v: %q\n%s", a.r.RemoteAddr, fmt.Sprint(p), debug.Stack())
 	a.client.Close()
 	a.target.Close()
 	c.Close()
@@ -248,7 +245,7 @@ func (a *association) watchControl(c *Conn) error {
 		if a.idle > 0 {
 			_ = c.SetReadDeadline(time.Unix(0, a.lastMove.Load()).Add(a.idle))
 		}
-		_, err := c.Read(b.in[:])
+		_, err := b.read(c, 0)
 		switch {
 		case err == nil:
 		case a.ctx.Err() != nil:
@@ -374,10 +371,8 @@ func (v *headerVerdict) matches(p []byte) bool {
 func parseClientHeader(p []byte) (wire.Addr, int, error) {
 	frag, addr, hl, err := wire.ParseUDPHeader(p)
 	switch {
-	case errors.Is(err, wire.ErrIncomplete):
-		return wire.Addr{}, 0, &wire.ProtocolError{Stage: wire.StageUDPHeader, Err: io.ErrUnexpectedEOF}
 	case err != nil:
-		return wire.Addr{}, 0, err
+		return wire.Addr{}, 0, neterr.Truncated(wire.StageUDPHeader, err)
 	case frag != 0:
 		return wire.Addr{}, 0, ErrFragment
 	}
@@ -416,26 +411,22 @@ func (a *association) lookup(name string, port uint16) (nameEntry, error) {
 	return e, nil
 }
 
+// resolve: a denial beats a lookup *net.DNSError, any other lookup error beats a denial.
 func (a *association) resolve(name string, port uint16) nameEntry {
 	ctx, cancel := context.WithTimeout(a.ctx, lookupTimeout)
-	ips, err := a.resolver.LookupNetIP(ctx, "ip", name)
+	var one [1]netip.Addr
+	ips, denial, err := a.filter.lookupAllowed(ctx, a.resolver, a.r, name, port, udpNetwork, one[:0])
 	cancel()
-	e := nameEntry{err: err}
-	if err == nil {
-		e.err = &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+	_, dns := err.(*net.DNSError)
+	switch {
+	case len(ips) > 0:
+		return nameEntry{ip: ips[0]}
+	case denial != nil && (err == nil || dns):
+		return nameEntry{err: denial}
+	case err != nil:
+		return nameEntry{err: err}
 	}
-	for _, ip := range ips {
-		ip = ip.Unmap().WithZone("")
-		ferr := a.filter.allow(a.r, udpNetwork(ip), netip.AddrPortFrom(ip, port))
-		if ferr == nil {
-			e.ip, e.err = ip, nil
-			break
-		}
-		if _, dns := e.err.(*net.DNSError); dns {
-			e.err = ferr
-		}
-	}
-	return e
+	return nameEntry{err: notFound(name)}
 }
 
 func (a *association) admit(dst netip.AddrPort) error {
@@ -451,10 +442,7 @@ func (a *association) admit(dst netip.AddrPort) error {
 	if a.full() {
 		return ErrTooManyTargets
 	}
-	network := udpNetwork(dst.Addr())
-	if err = a.filter.allow(a.r, network, dst); err == nil {
-		err = a.filter.checkOwnHost(a.r, network, ownHost(dst), dst, nil)
-	}
+	err = a.filter.vet(a.r, udpNetwork(dst.Addr()), dst)
 	a.mu.Lock()
 	a.targets[dst] = err
 	if err == nil {

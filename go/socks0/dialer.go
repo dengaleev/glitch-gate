@@ -68,9 +68,9 @@ var errNoProxyConn = errors.New("socks0: ProxyDial returned no conn and no error
 // wrapping a *HandshakeError (and ctx.Err() on cancellation); on error no
 // conn is left open.
 func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	target, err := d.parseTarget(network, addr)
 	switch network {
 	case "udp", "udp4", "udp6":
-		target, err := d.parseTarget(network, addr)
 		var dst string
 		if d != nil {
 			dst = d.AssociateAddr
@@ -81,7 +81,6 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 		}
 		return c, nil
 	}
-	target, err := d.parseTarget(network, addr)
 	if d != nil && d.Config != nil && d.Config.Mode == ModeEarly {
 		return d.dialEarly(ctx, network, target, err)
 	}
@@ -89,8 +88,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 	if _, err := d.newConn(&ctx, &c, opConnect, network, wire.CmdConnect, target, err); err != nil {
 		return nil, err
 	}
-	conn, _, err := d.connect(ctx, &c)
-	return conn, err
+	return d.connect(ctx, &c)
 }
 
 func (d *Dialer) dialEarly(ctx context.Context, network string, target wire.Addr, err error) (net.Conn, error) {
@@ -99,11 +97,11 @@ func (d *Dialer) dialEarly(ctx context.Context, network string, target wire.Addr
 	if _, err := d.newConn(&ctx, c, opConnect, network, wire.CmdConnect, target, err); err != nil {
 		return nil, err
 	}
-	conn, _, err := d.connect(ctx, c)
+	conn, err := d.connect(ctx, c)
 	if err != nil {
 		return nil, err
 	}
-	c.conn, c.traceSet, c.h.mu = conn, true, &c.mu
+	c.conn, c.h.mu = conn, &c.mu // c.trace is the dial's
 	return c, nil
 }
 
@@ -141,7 +139,7 @@ func (d *Dialer) newConn(ctx *context.Context, c *Conn, op, network string, cmd 
 	if d == nil {
 		return target, c.opError(&HandshakeError{StageConfig, errors.New("socks0: nil Dialer")})
 	}
-	c.proxy, _ = wire.ParseAddr(d.ProxyAddr)
+	c.proxyAddr = d.ProxyAddr
 	if err == nil {
 		err = c.init(d.Config, cmd, target)
 	}
@@ -173,46 +171,50 @@ func (d *Dialer) resolveTarget(ctx context.Context, c *Conn, network string, tar
 	return resolved, nil
 }
 
-// connect dials the proxy and, except in ModeEarly, runs the handshake; on
-// error the conn is closed.
-func (d *Dialer) connect(ctx context.Context, c *Conn) (net.Conn, tracer, error) {
-	ctx, cancel, connTimeout := d.dialTimeout(ctx, c.handshakeTimeout)
+// connect dials the proxy, choosing c.trace, and, except in ModeEarly, runs
+// the handshake; on error the conn is closed.
+func (d *Dialer) connect(ctx context.Context, c *Conn) (net.Conn, error) {
+	ctx, cancel, connTimeout := d.dialTimeout(ctx, c)
 	if cancel != nil {
 		defer cancel()
 	}
-	tr := newTracer(ctx, c.configTrace)
-	conn, err := d.dialProxy(ctx, tr)
+	c.trace = newTracer(ctx, c.configTrace)
+	conn, err := d.dialProxy(ctx, c.trace)
 	if err != nil {
-		return nil, tr, c.opError(&HandshakeError{StageProxyDial, ctxErr(ctx, err)})
+		return nil, c.opError(&HandshakeError{StageProxyDial, ctxErr(ctx, err)})
 	}
-	c.trace = tr
 	if c.h.mode == ModeEarly {
 		conn.SetDeadline(time.Time{})
-		return conn, tr, nil
+		return conn, nil
 	}
 	var deadline time.Time
 	if connTimeout > 0 {
 		deadline = time.Now().Add(connTimeout)
 		conn.SetDeadline(deadline)
 	}
-	if err := c.handshakeOver(ctx, conn, tr, conn.Close, deadline); err != nil {
-		return nil, tr, err
+	if err := c.handshakeOver(ctx, conn, true, deadline); err != nil {
+		return nil, err
 	}
 	conn.SetDeadline(time.Time{})
-	return conn, tr, nil
+	return conn, nil
 }
 
-// dialTimeout: the built-in dial gets a conn deadline (no per-dial timer
-// ctx); a ProxyDial can tarpit (TLS, a chain), so it gets the ctx.
-func (d *Dialer) dialTimeout(ctx context.Context, t time.Duration) (_ context.Context, cancel context.CancelFunc, connTimeout time.Duration) {
-	if t == 0 && d.ProxyDial == nil && !hasDeadline(ctx) {
-		return ctx, nil, defaultHandshakeTimeout
+// dialTimeout applies the handshake budget: the built-in dial with the
+// default timeout gets a conn deadline (no per-dial timer ctx); a ProxyDial
+// can tarpit (TLS, a chain), so it gets the ctx.
+func (d *Dialer) dialTimeout(ctx context.Context, c *Conn) (_ context.Context, cancel context.CancelFunc, connTimeout time.Duration) {
+	budget, ok := c.handshakeBudget(ctx)
+	switch {
+	case !ok:
+		return ctx, nil, 0
+	case d.ProxyDial == nil && c.handshakeTimeout == 0:
+		return ctx, nil, budget
 	}
-	ctx, cancel = handshakeCtx(ctx, t)
+	ctx, cancel = context.WithTimeout(ctx, budget)
 	return ctx, cancel, 0
 }
 
-func (d *Dialer) dialProxy(ctx context.Context, tr tracer) (net.Conn, error) {
+func (d *Dialer) dialProxy(ctx context.Context, tr *ClientTrace) (net.Conn, error) {
 	tr.connectStart("tcp", d.ProxyAddr)
 	dial := d.ProxyDial
 	if dial == nil {
@@ -257,13 +259,17 @@ func (d *Dialer) parseTarget(network, addr string) (wire.Addr, error) {
 		return wire.Addr{}, err
 	}
 	if !matchesFamily(network, a.IP()) {
-		return a, &net.AddrError{Err: "address family mismatch for " + network, Addr: addr}
+		return a, familyErr(network, addr)
 	}
 	return a, nil
 }
 
+func familyErr(network, addr string) error {
+	return &net.AddrError{Err: "address family mismatch for " + network, Addr: addr}
+}
+
 func (d *Dialer) resolve(ctx context.Context, network, host string) (netip.Addr, error) {
-	ips, err := d.Resolver.LookupNetIP(ctx, "ip"+network[len("tcp"):], host)
+	ips, err := d.Resolver.LookupNetIP(ctx, ipNetwork(network), host)
 	if err != nil {
 		return netip.Addr{}, err
 	}
@@ -297,6 +303,17 @@ func ctxErr(ctx context.Context, err error) error {
 		return cerr
 	}
 	return err
+}
+
+// ipNetwork maps "tcp*" and "udp*" to "ip*".
+func ipNetwork(network string) string {
+	switch network[len(network)-1] {
+	case '4':
+		return "ip4"
+	case '6':
+		return "ip6"
+	}
+	return "ip"
 }
 
 func matchesFamily(network string, ip netip.Addr) bool {

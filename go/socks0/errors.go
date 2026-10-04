@@ -8,6 +8,8 @@ import (
 	"net"
 	"strings"
 
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/errno"
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/neterr"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
@@ -63,11 +65,11 @@ func (e *HandshakeError) Error() string {
 	if !strings.HasPrefix(stage, "socks4 ") {
 		stage = "socks " + stage
 	}
-	switch e.Err.(type) {
-	case *ReplyError, *MethodError, *AuthError, *ProtocolError:
-		return e.Err.Error()
-	case nil:
+	switch {
+	case e.Err == nil:
 		return stage + ": handshake failed"
+	case serverMsg(e.Err, false):
+		return e.Err.Error()
 	}
 	return stage + ": " + e.Err.Error()
 }
@@ -80,14 +82,7 @@ func (e *HandshakeError) Unwrap() error {
 }
 
 func (e *HandshakeError) Timeout() bool {
-	if e == nil {
-		return false
-	}
-	t, ok := errors.AsType[interface {
-		error
-		Timeout() bool
-	}](e.Err)
-	return ok && t.Timeout()
+	return e != nil && neterr.IsTimeout(e.Err)
 }
 
 // ReplyError is a non-success REP (SOCKS4: CD), returned even if the rest of
@@ -122,7 +117,7 @@ func (e *ReplyError) Is(target error) bool {
 	case target == ErrNotAllowed:
 		return e.Reply == wire.ReplyNotAllowed
 	}
-	return e.isErrno(target)
+	return errno.Is(e.Reply, target)
 }
 
 // MethodError is a method selection the client cannot use.
@@ -256,7 +251,7 @@ func transportKind(err error, he *HandshakeError) Kind {
 		return KindClosed
 	case hasErrType[*net.DNSError](err):
 		return KindDNS
-	case isTimeout(err):
+	case neterr.IsTimeout(err):
 		return KindTimeout
 	}
 	if k := errnoKind(err); k != "" {
@@ -279,35 +274,24 @@ func hasErrType[T error](err error) bool {
 	return ok
 }
 
-func isTimeout(err error) bool {
-	for err != nil {
-		if t, ok := err.(interface{ Timeout() bool }); ok && t.Timeout() {
-			return true
-		}
-		switch u := err.(type) {
-		case interface{ Unwrap() error }:
-			err = u.Unwrap()
-		case interface{ Unwrap() []error }:
-			for _, e := range u.Unwrap() {
-				if isTimeout(e) {
-					return true
-				}
-			}
-			return false
-		default:
-			return false
-		}
+// serverMsg reports a server message error (*ReplyError, *MethodError,
+// *AuthError, *ProtocolError): err itself or, if deep, any in its tree.
+func serverMsg(err error, deep bool) bool {
+	return isErrType[*ReplyError](err, deep) || isErrType[*MethodError](err, deep) ||
+		isErrType[*AuthError](err, deep) || isErrType[*ProtocolError](err, deep)
+}
+
+func isErrType[T error](err error, deep bool) bool {
+	if deep {
+		return hasErrType[T](err)
 	}
-	return false
+	_, ok := err.(T)
+	return ok
 }
 
 // isServerMsgErr: a local deadline or cancellation cannot have caused err.
 func isServerMsgErr(err error) bool {
-	switch err.(type) {
-	case *ReplyError, *MethodError, *AuthError, *ProtocolError:
-		return true
-	}
-	return errors.Is(err, ErrAuthFailed)
+	return serverMsg(err, false) || errors.Is(err, ErrAuthFailed)
 }
 
 // IsProxyError reports a SOCKS-layer failure (a *HandshakeError,
@@ -320,6 +304,5 @@ func IsProxyError(err error) bool {
 	case hasErrType[*HandshakeError](err), errors.Is(err, ErrAssociationClosed):
 		return true
 	}
-	return hasErrType[*ReplyError](err) || hasErrType[*MethodError](err) ||
-		hasErrType[*AuthError](err) || hasErrType[*ProtocolError](err)
+	return serverMsg(err, true)
 }

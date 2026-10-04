@@ -106,100 +106,90 @@ func join3[A, B, C any](f, g func(A, B, C)) func(A, B, C) {
 	return func(a A, b B, c C) { f(a, b, c); g(a, b, c) }
 }
 
-type tracer [2]*ClientTrace
+// noTrace runs no hooks; newTracer returns it, never nil, so a Conn's trace
+// is nil only until chosen.
+var noTrace = new(ClientTrace)
 
-func newTracer(ctx context.Context, cfg *ClientTrace) tracer {
-	return tracer{cfg, ContextClientTrace(ctx)}
+// newTracer returns cfg's hooks, then ctx's.
+func newTracer(ctx context.Context, cfg *ClientTrace) *ClientTrace {
+	t := ContextClientTrace(ctx)
+	switch {
+	case cfg == nil && t == nil:
+		return noTrace
+	case t == nil:
+		return cfg
+	case cfg == nil:
+		return t
+	}
+	return compose(cfg, t)
 }
 
-func (t tracer) connectStart(network, addr string) {
-	for _, h := range t {
-		if h != nil && h.ConnectStart != nil {
-			h.ConnectStart(network, addr)
-		}
+// The hook runners take a nil t.
+
+func (t *ClientTrace) connectStart(network, addr string) {
+	if t != nil && t.ConnectStart != nil {
+		t.ConnectStart(network, addr)
 	}
 }
 
-func (t tracer) connectDone(network, addr string, err error) {
-	for _, h := range t {
-		if h != nil && h.ConnectDone != nil {
-			h.ConnectDone(network, addr, err)
-		}
+func (t *ClientTrace) connectDone(network, addr string, err error) {
+	if t != nil && t.ConnectDone != nil {
+		t.ConnectDone(network, addr, err)
 	}
 }
 
-func (t tracer) wroteHandshake(err error) {
-	for _, h := range t {
-		if h != nil && h.WroteHandshake != nil {
-			h.WroteHandshake(err)
-		}
+func (t *ClientTrace) wroteHandshake(err error) {
+	if t != nil && t.WroteHandshake != nil {
+		t.WroteHandshake(err)
 	}
 }
 
-func (t tracer) gotMethod(m wire.Method) {
-	for _, h := range t {
-		if h != nil && h.GotMethod != nil {
-			h.GotMethod(m)
-		}
+func (t *ClientTrace) gotMethod(m wire.Method) {
+	if t != nil && t.GotMethod != nil {
+		t.GotMethod(m)
 	}
 }
 
-func (t tracer) authDone(err error) {
-	for _, h := range t {
-		if h != nil && h.AuthDone != nil {
-			h.AuthDone(err)
-		}
+func (t *ClientTrace) authDone(err error) {
+	if t != nil && t.AuthDone != nil {
+		t.AuthDone(err)
 	}
 }
 
-func (t tracer) gotReply(rep wire.Reply, bound wire.Addr) {
-	for _, h := range t {
-		if h != nil && h.GotReply != nil {
-			h.GotReply(rep, bound)
-		}
+func (t *ClientTrace) gotReply(rep wire.Reply, bound wire.Addr) {
+	if t != nil && t.GotReply != nil {
+		t.GotReply(rep, bound)
 	}
 }
 
-func (t tracer) handshakeDone(err error) {
-	for _, h := range t {
-		if h != nil && h.HandshakeDone != nil {
-			h.HandshakeDone(err)
-		}
+func (t *ClientTrace) handshakeDone(err error) {
+	if t != nil && t.HandshakeDone != nil {
+		t.HandshakeDone(err)
 	}
 }
 
-func (t tracer) relayDialStart(network, addr string) {
-	for _, h := range t {
-		if h != nil && h.RelayDialStart != nil {
-			h.RelayDialStart(network, addr)
-		}
+func (t *ClientTrace) relayDialStart(network, addr string) {
+	if t != nil && t.RelayDialStart != nil {
+		t.RelayDialStart(network, addr)
 	}
 }
 
-func (t tracer) relayDialDone(network, addr string, err error) {
-	for _, h := range t {
-		if h != nil && h.RelayDialDone != nil {
-			h.RelayDialDone(network, addr, err)
-		}
+func (t *ClientTrace) relayDialDone(network, addr string, err error) {
+	if t != nil && t.RelayDialDone != nil {
+		t.RelayDialDone(network, addr, err)
 	}
 }
 
-func (t tracer) hasDroppedHook() bool {
-	return t[0] != nil && t[0].DroppedDatagram != nil || t[1] != nil && t[1].DroppedDatagram != nil
-}
+func (t *ClientTrace) hasDroppedHook() bool { return t != nil && t.DroppedDatagram != nil }
 
-func (t tracer) droppedDatagram(from wire.Addr, err error) {
-	for _, h := range t {
-		if h != nil && h.DroppedDatagram != nil {
-			h.DroppedDatagram(from, err)
-		}
+func (t *ClientTrace) droppedDatagram(from wire.Addr, err error) {
+	if t.hasDroppedHook() {
+		t.DroppedDatagram(from, err)
 	}
 }
 
-func (t tracer) accepted(peer wire.Addr, err error) {
-	for _, h := range t {
-		if h != nil && h.Accepted != nil {
-			h.Accepted(peer, err)
-		}
+func (t *ClientTrace) accepted(peer wire.Addr, err error) {
+	if t != nil && t.Accepted != nil {
+		t.Accepted(peer, err)
 	}
 }

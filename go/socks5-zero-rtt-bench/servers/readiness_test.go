@@ -16,7 +16,7 @@ import (
 // the raw conn instead of the bufio.Reader it parsed with, the classic bug
 // that strands early data.
 func refServer(leaky bool) Server {
-	return Server{Name: "ref", UserPass: true, Serve: func(ln net.Listener, user, pass string) error {
+	return Server{Name: "ref", Serve: func(ln net.Listener, user, pass string) error {
 		return serveEach(ln, func(c net.Conn) {
 			br := bufio.NewReader(c)
 			t, err := refHandshake(br, c, user, pass)
@@ -114,8 +114,8 @@ func TestCheckLeakyServer(t *testing.T) {
 // TestLeakyServerEverySplit guards that every split keeps the data early.
 func TestLeakyServerEverySplit(t *testing.T) {
 	s := refServer(true)
-	for _, k := range matrix(false) {
-		if k.size == 0 {
+	for _, k := range matrix() {
+		if k.size == 0 || k.user != "" {
 			continue
 		}
 		if err := checkCase(t.Context(), s, k); err == nil {

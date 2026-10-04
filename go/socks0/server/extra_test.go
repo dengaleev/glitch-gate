@@ -89,6 +89,9 @@ func TestBindErrors(t *testing.T) {
 				t.Errorf("second ReplyListening: %v", err)
 			}
 			_, err := r.Reply(wire.ReplyConnectionRefused, wire.Addr{})
+			if err := r.ReplyListening(wire.Addr{}); !errors.Is(err, server.ErrReplied) {
+				t.Errorf("ReplyListening after Reply: %v", err)
+			}
 			return err
 		})
 		c, errc := serveOne(t, s)

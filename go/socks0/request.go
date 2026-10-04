@@ -25,7 +25,8 @@ func Request(ctx context.Context, conn net.Conn, cmd wire.Command, addr wire.Add
 	if err := c.init(cfg, cmd, addr); err != nil {
 		return wire.Addr{}, c.opError(&HandshakeError{StageConfig, err})
 	}
-	if err := c.handshakeOver(ctx, conn, newTracer(ctx, c.configTrace), nil, time.Time{}); err != nil {
+	c.trace = newTracer(ctx, c.configTrace)
+	if err := c.handshakeOver(ctx, conn, false, time.Time{}); err != nil {
 		return wire.Addr{}, err
 	}
 	return c.h.bound, nil

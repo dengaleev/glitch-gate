@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"strings"
@@ -109,4 +110,51 @@ func mustAddr(s string) wire.Addr {
 		panic(err)
 	}
 	return a
+}
+
+type resolverFunc func() ([]netip.Addr, error)
+
+func (f resolverFunc) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) { return f() }
+
+// association.resolve: the first allowed IP; else a denial beats a lookup *net.DNSError and any
+// other lookup error beats a denial; no answer and no error is not found.
+func TestAssociationResolve(t *testing.T) {
+	ip := netip.MustParseAddr
+	denied, broke := &DeniedError{Reason: "test"}, errors.New("resolver broke")
+	dnsErr := &net.DNSError{Err: "server misbehaving", Name: "x.test"}
+	deny1 := Filter(func(_ *Request, _ string, a netip.AddrPort) error {
+		if a.Addr() == ip("192.0.2.1") {
+			return denied
+		}
+		return nil
+	})
+	for _, tc := range []struct {
+		name   string
+		ips    []netip.Addr
+		err    error
+		wantIP netip.Addr
+		want   error
+	}{
+		{"first allowed", []netip.Addr{ip("192.0.2.1"), ip("::ffff:192.0.2.2"), ip("192.0.2.3")}, nil, ip("192.0.2.2"), nil},
+		{"allowed despite an error", []netip.Addr{ip("192.0.2.2")}, broke, ip("192.0.2.2"), nil},
+		{"all denied", []netip.Addr{ip("192.0.2.1")}, nil, netip.Addr{}, denied},
+		{"denied, DNS error", []netip.Addr{ip("192.0.2.1")}, dnsErr, netip.Addr{}, denied},
+		{"denied, other error", []netip.Addr{ip("192.0.2.1")}, broke, netip.Addr{}, broke},
+		{"DNS error", nil, dnsErr, netip.Addr{}, dnsErr},
+		{"no answer", nil, nil, netip.Addr{}, nil},
+	} {
+		a := &association{ctx: context.Background(), r: &Request{}, filter: deny1, resolver: resolverFunc(func() ([]netip.Addr, error) { return tc.ips, tc.err })}
+		e := a.resolve("x.test", 53)
+		switch {
+		case e.ip != tc.wantIP:
+			t.Errorf("%s: ip %v, want %v", tc.name, e.ip, tc.wantIP)
+		case tc.want != nil && e.err != tc.want:
+			t.Errorf("%s: err %v, want %v", tc.name, e.err, tc.want)
+		case tc.want == nil && tc.wantIP.IsValid() != (e.err == nil):
+			t.Errorf("%s: err %v", tc.name, e.err)
+		}
+		if de, ok := e.err.(*net.DNSError); tc.name == "no answer" && (!ok || !de.IsNotFound || de.Name != "x.test") {
+			t.Errorf("no answer: %#v", e.err)
+		}
+	}
 }

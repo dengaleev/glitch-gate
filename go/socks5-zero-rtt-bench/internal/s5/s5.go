@@ -15,14 +15,33 @@ const (
 	MethodUserPass = 0x02
 )
 
+// Address types (ATYP).
+const (
+	AtypIPv4   = 1
+	AtypDomain = 3
+	AtypIPv6   = 4
+)
+
 const (
 	socksVersion = 5
 	authVersion  = 1
 	cmdConnect   = 1
-	atypIPv4     = 1
-	atypDomain   = 3
-	atypIPv6     = 4
 )
+
+// AddrLen is the length of a DST/BND.ADDR of type atyp, given its first
+// byte: 4 or 16 for an IP, or the length byte plus the name for a domain.
+// ok is false for an unknown atyp.
+func AddrLen(atyp, first byte) (n int, ok bool) {
+	switch atyp {
+	case AtypIPv4:
+		return net.IPv4len, true
+	case AtypIPv6:
+		return net.IPv6len, true
+	case AtypDomain:
+		return 1 + int(first), true
+	}
+	return 0, false
+}
 
 // Method is the one auth method a client commits to: user/pass if user is
 // set, else none. A single method makes replies predictable, so pipelining
@@ -61,12 +80,12 @@ func Connect(target string) ([]byte, error) {
 		if len(host) > 255 {
 			return nil, errors.New("domain too long")
 		}
-		b = append(b, atypDomain, byte(len(host)))
+		b = append(b, AtypDomain, byte(len(host)))
 		b = append(b, host...)
 	case ip.To4() != nil:
-		b = append(append(b, atypIPv4), ip.To4()...)
+		b = append(append(b, AtypIPv4), ip.To4()...)
 	default:
-		b = append(append(b, atypIPv6), ip.To16()...)
+		b = append(append(b, AtypIPv6), ip.To16()...)
 	}
 	return append(b, byte(port>>8), byte(port)), nil
 }
@@ -115,19 +134,12 @@ func ReadConnectReply(r io.Reader) error {
 	if h[0] != socksVersion || h[1] != 0 {
 		return fmt.Errorf("connect rejected (ver 0x%02x, rep 0x%02x)", h[0], h[1])
 	}
-	var addrLeft int
-	switch h[3] {
-	case atypIPv4:
-		addrLeft = net.IPv4len - 1
-	case atypIPv6:
-		addrLeft = net.IPv6len - 1
-	case atypDomain:
-		addrLeft = int(h[4])
-	default:
+	addrLen, ok := AddrLen(h[3], h[4])
+	if !ok {
 		return fmt.Errorf("connect reply: bad atyp 0x%02x", h[3])
 	}
 	const portLen = 2
-	if _, err := io.ReadFull(r, make([]byte, addrLeft+portLen)); err != nil {
+	if _, err := io.ReadFull(r, make([]byte, addrLen-1+portLen)); err != nil {
 		return fmt.Errorf("read connect reply address: %w", err)
 	}
 	return nil

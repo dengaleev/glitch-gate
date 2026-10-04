@@ -1,7 +1,6 @@
 package socks0
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/neterr"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
@@ -23,6 +23,9 @@ var (
 )
 
 const maxEarlyData = 32 << 10
+
+// aLongTimeAgo is a past deadline that wakes blocked I/O.
+var aLongTimeAgo = time.Unix(1, 0)
 
 // Conn is a connection through a SOCKS proxy (Client, ClientAddr, a ModeEarly
 // Dialer, Listener.Accept). The first HandshakeContext, Read, Write, ReadFrom,
@@ -38,25 +41,22 @@ const maxEarlyData = 32 << 10
 type Conn struct {
 	conn             net.Conn
 	h                handshake
-	op               string    // of handshake errors; "" is "socks connect"
-	network          string    // of errors
-	proxy            wire.Addr // Source of errors; the conn's RemoteAddr if invalid
-	laddr, raddr     net.Addr  // Listener.Accept's
+	op               string   // of handshake errors
+	network          string   // of errors
+	proxyAddr        string   // Source of errors if it parses; else the conn's RemoteAddr
+	laddr, raddr     net.Addr // Listener.Accept's
 	replyTimeout     time.Duration
 	handshakeTimeout time.Duration
 	configTrace      *ClientTrace
 	doneAfterRelay   bool // a successful UDP ASSOCIATE's HandshakeDone is the caller's
 
-	// Fast paths that skip mu.
+	// Fast paths that skip mu, kept by storeReadyLocked.
 	readReady  atomic.Bool // replies consumed
 	writeReady atomic.Bool // handshake written without error
-	isShut     atomic.Bool // closed
 
 	mu            sync.Mutex
-	trace         tracer
-	traceSet      bool
-	claimed       bool // a call is sending, or has sent, the handshake
-	written       bool // its write is over
+	trace         *ClientTrace // nil until chosen by the claim (a Dialer's: by the dial)
+	phase         phase
 	busy          bool // a call is reading the replies or running the handshake
 	done          bool // err or bound is set
 	closed        bool
@@ -70,29 +70,42 @@ type Conn struct {
 	inline [128]byte
 }
 
+// phase is how far the handshake write went. The handshake can end (done) in
+// any phase: a config error or cancellation in phaseIdle, replies that beat
+// the end of the write in phaseSending.
+type phase uint8
+
+const (
+	phaseIdle    phase = iota
+	phaseSending       // a call claimed the handshake and is writing it (L0/L1: running it)
+	phaseSent          // the handshake write is over
+)
+
 // Client returns a Conn that runs the handshake for target over conn (TCP,
 // TLS, a mux stream). Names go to the proxy unresolved. Invalid arguments
 // surface as the handshake error.
 func Client(conn net.Conn, target string, cfg *Config) *Conn {
 	a, err := wire.ParseAddr(target)
-	c := ClientAddr(conn, a, cfg)
-	if err != nil && c.conn != nil {
-		c.err = c.opError(&HandshakeError{StageConfig, err})
-	}
-	return c
+	return newClient(conn, a, cfg, err)
 }
 
 func ClientAddr(conn net.Conn, target wire.Addr, cfg *Config) *Conn {
-	c := &Conn{conn: conn, network: "tcp"}
+	return newClient(conn, target, cfg, nil)
+}
+
+// newClient fails the handshake with parseErr, target's, if set; Config is
+// applied anyway: its version shapes later errors.
+func newClient(conn net.Conn, target wire.Addr, cfg *Config, parseErr error) *Conn {
+	c := &Conn{conn: conn, op: opConnect, network: "tcp"}
 	c.h.target, c.h.mu, c.h.buf = target, &c.mu, c.inline[:0] // target for config errors too
-	if conn == nil {
-		c.err = c.opError(&HandshakeError{StageConfig, errNoConn})
-		c.done = true
-		return c
+	err := errNoConn
+	if conn != nil {
+		if err = c.init(cfg, wire.CmdConnect, target); parseErr != nil {
+			err = parseErr
+		}
 	}
-	if err := c.init(cfg, wire.CmdConnect, target); err != nil {
-		c.err = c.opError(&HandshakeError{StageConfig, err})
-		c.done = true
+	if err != nil {
+		c.failLocked(&HandshakeError{StageConfig, err}) // c is not shared yet
 	}
 	return c
 }
@@ -115,9 +128,6 @@ func (c *Conn) HandshakeContext(ctx context.Context) error {
 	if c.readReady.Load() {
 		return nil
 	}
-	if c.conn == nil {
-		return c.noConn("socks connect")
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -127,7 +137,7 @@ func (c *Conn) HandshakeContext(ctx context.Context) error {
 		stop := context.AfterFunc(ctx, func() { c.abortWith(ctx.Err()) })
 		defer stop()
 	}
-	return c.handshake(ctx, "socks connect", true)
+	return c.handshake(ctx, opConnect, true)
 }
 
 func (c *Conn) handshake(ctx context.Context, op string, send bool) error {
@@ -155,9 +165,6 @@ func (c *Conn) NetConn() net.Conn { return c.conn }
 
 func (c *Conn) Read(b []byte) (int, error) {
 	if !c.readReady.Load() {
-		if c.conn == nil {
-			return 0, c.noConn("read")
-		}
 		if err := c.handshake(context.Background(), "read", false); err != nil {
 			return 0, err
 		}
@@ -169,9 +176,6 @@ func (c *Conn) Read(b []byte) (int, error) {
 // Write's count excludes handshake bytes.
 func (c *Conn) Write(b []byte) (int, error) {
 	if !c.writeReady.Load() {
-		if c.conn == nil {
-			return 0, c.noConn("write")
-		}
 		if c.h.mode == ModeEarly {
 			return c.writeEarly(b)
 		}
@@ -196,7 +200,9 @@ func (c *Conn) writeEarly(b []byte) (int, error) {
 		return n, c.ioErr("write", err)
 	}
 	k := min(len(b), maxEarlyData)
-	n, err := c.send(append(append(make([]byte, 0, len(c.h.out)+k), c.h.out...), b[:k]...))
+	buf, p := c.earlyBuf(k)
+	n, err := c.send(append(buf, b[:k]...))
+	putEarlyBuf(p, len(buf)+k)
 	if err != nil || k == len(b) {
 		return n, err
 	}
@@ -208,9 +214,6 @@ func (c *Conn) writeEarly(b []byte) (int, error) {
 func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
 	var sent int64
 	if !c.writeReady.Load() {
-		if c.conn == nil {
-			return 0, c.noConn("readfrom")
-		}
 		var done bool
 		var err error
 		if c.h.mode == ModeEarly {
@@ -228,7 +231,7 @@ func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
 
 func (c *Conn) readFromEarly(r io.Reader) (n int64, done bool, err error) {
 	c.mu.Lock()
-	err, claimed := c.checkLocked("readfrom"), c.claimed
+	err, claimed := c.checkLocked("readfrom"), c.phase != phaseIdle
 	c.mu.Unlock()
 	switch {
 	case err != nil:
@@ -237,42 +240,76 @@ func (c *Conn) readFromEarly(r io.Reader) (n int64, done bool, err error) {
 		return 0, false, c.waitWritten("readfrom")
 	}
 	hs := len(c.h.out)
-	buf := append(make([]byte, 0, hs+maxEarlyData), c.h.out...)
-	var m int
-	var rerr error
-	for m == 0 && rerr == nil {
-		m, rerr = r.Read(buf[hs:cap(buf)])
-	}
+	buf, p := c.earlyBuf(maxEarlyData)
+	m, rerr := readSome(r, buf[hs:cap(buf)])
 	eof := errors.Is(rerr, io.EOF)
-	if m == 0 && !eof {
-		return 0, true, rerr
-	}
-	mustSend, err := c.claim(context.Background(), "readfrom")
-	if err != nil {
-		return 0, true, err
-	}
-	var w int
-	if mustSend {
-		w, err = c.send(buf[:hs+m])
-	} else {
-		c.h.wipe(buf) // its copy of the handshake is not sent
-		if err = c.waitWritten("readfrom"); err == nil {
-			w, err = c.conn.Write(buf[hs : hs+m])
-			err = c.ioErr("readfrom", err)
+	w, err := 0, rerr
+	if m != 0 || eof {
+		if w, err = c.sendFirstRead(buf[:hs+m]); err == nil && !eof {
+			err = rerr
 		}
 	}
-	if err == nil && !eof {
-		err = rerr
-	}
+	putEarlyBuf(p, hs+m)
 	return int64(w), err != nil || rerr != nil, err
+}
+
+// readSome reads until it gets data or an error.
+func readSome(r io.Reader, b []byte) (n int, err error) {
+	for n == 0 && err == nil {
+		n, err = r.Read(b)
+	}
+	return n, err
+}
+
+// sendFirstRead sends b, the handshake and ReadFrom's first data, if this
+// call claims the handshake; else the data alone, after the claimer's write.
+func (c *Conn) sendFirstRead(b []byte) (int, error) {
+	mustSend, err := c.claim(context.Background(), "readfrom")
+	switch {
+	case err != nil:
+		return 0, err
+	case mustSend:
+		return c.send(b)
+	}
+	c.h.wipe(b) // its copy of the handshake is not sent
+	if err := c.waitWritten("readfrom"); err != nil {
+		return 0, err
+	}
+	n, err := c.conn.Write(b[len(c.h.out):])
+	return n, c.ioErr("readfrom", err)
+}
+
+// maxHandshake fits the built-in handshakes (RFC 1929 auth included) in an
+// earlyArray; a longer custom Pipeliner request gets an allocated buffer.
+const maxHandshake = 1 << 10
+
+type earlyArray [maxHandshake + maxEarlyData]byte
+
+var earlyBufs = sync.Pool{New: func() any { return new(earlyArray) }}
+
+// earlyBuf returns the handshake with room for n bytes of data, and the
+// pooled array holding it, if any, for putEarlyBuf. A buffer of up to
+// maxHandshake bytes is allocated: cheaper than refilling the pool after a GC.
+func (c *Conn) earlyBuf(n int) ([]byte, *earlyArray) {
+	hs := len(c.h.out)
+	if hs > maxHandshake || hs+n <= maxHandshake {
+		return append(make([]byte, 0, hs+n), c.h.out...), nil
+	}
+	p := earlyBufs.Get().(*earlyArray)
+	return append(p[:0:hs+n], c.h.out...), p
+}
+
+// putEarlyBuf zeroes the used bytes of p, then pools it.
+func putEarlyBuf(p *earlyArray, used int) {
+	if p != nil {
+		clear(p[:used])
+		earlyBufs.Put(p)
+	}
 }
 
 // WriteTo waits for the replies; splice applies.
 func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 	if !c.readReady.Load() {
-		if c.conn == nil {
-			return 0, c.noConn("writeto")
-		}
 		if err := c.handshake(context.Background(), "writeto", false); err != nil {
 			return 0, err
 		}
@@ -284,9 +321,6 @@ func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 // CloseWrite waits for the replies, then half-closes; errors.ErrUnsupported
 // if the underlying conn cannot.
 func (c *Conn) CloseWrite() error {
-	if c.conn == nil {
-		return c.noConn("close")
-	}
 	c.mu.Lock()
 	err := c.checkLocked("close")
 	c.mu.Unlock()
@@ -316,12 +350,10 @@ func (c *Conn) Close() error {
 		return c.connErr("close", net.ErrClosed)
 	}
 	c.closed = true
-	c.isShut.Store(true)
-	c.readReady.Store(false)
-	c.writeReady.Store(false)
 	if c.abortErr == nil && !c.done {
 		c.abortErr = net.ErrClosed
 	}
+	c.storeReadyLocked()
 	c.settleUnlock()
 	return c.conn.Close()
 }
@@ -397,51 +429,55 @@ func (c *Conn) SyscallConn() (syscall.RawConn, error) {
 	return sc.SyscallConn()
 }
 
+// The handshake's state machine. c.phase only advances: phaseIdle, claimed by
+// one call (run for L0/L1; claim then send for L2) to phaseSending, then
+// phaseSent. Another call (L2: awaitReplies) may read the replies once the
+// handshake is claimed. endLocked ends the handshake once (done), updating
+// the fast paths and deciding whether HandshakeDone runs; abortWith and Close
+// make it fail with abortErr once no call is working on it.
+
 func (c *Conn) run(ctx context.Context, op string) error {
 	c.mu.Lock()
-	if mustRun, err := c.claimRunLocked(op); !mustRun {
+	if mustRun, err := c.claimRunLocked(ctx, op); !mustRun {
 		c.mu.Unlock()
 		return err
 	}
-	c.setTraceLocked(ctx)
 	tr := c.trace
 	c.mu.Unlock()
 
-	wrote, he := c.runTimed(ctx, tr)
+	he := c.runTimed(ctx, tr)
 
 	c.mu.Lock()
 	c.endIOLocked(ctx)
-	c.finishLocked(c.blameAbortLocked(he))
-	err, herr := c.checkLocked(op), c.err
-	c.mu.Unlock()
-	if wrote {
-		tr.handshakeDone(herr)
-	}
+	c.phase = phaseSent
+	hook := c.endLocked(c.blame(he, c.abortErr, time.Time{}, nil))
+	err := c.checkLocked(op)
+	c.unlockDone(hook)
 	return err
 }
 
-func (c *Conn) claimRunLocked(op string) (mustRun bool, err error) {
+func (c *Conn) claimRunLocked(ctx context.Context, op string) (mustRun bool, err error) {
 	for {
 		if err := c.checkLocked(op); err != nil || c.done {
 			return false, err
 		}
-		if c.abortErr != nil && !c.claimed { // canceled before anything was sent
-			c.finishLocked(&HandshakeError{c.h.writeStage(0), c.abortErr})
-			continue
+		switch {
+		case c.phase != phaseIdle:
+			c.waitLocked(time.Time{})
+		case c.abortErr != nil: // canceled before anything was sent
+			c.endLocked(&HandshakeError{c.h.writeStage(0), c.abortErr})
+		default:
+			c.claimLocked(ctx)
+			c.busy = true
+			return true, nil
 		}
-		if !c.claimed {
-			break
-		}
-		c.waitLocked(time.Time{})
 	}
-	c.claimed, c.written, c.busy = true, true, true
-	return true, nil
 }
 
 // runTimed uses a bare timer, not a timer ctx: a fifth of the allocations.
-func (c *Conn) runTimed(ctx context.Context, tr tracer) (wrote bool, he *HandshakeError) {
-	if t := c.handshakeWait(ctx); t > 0 {
-		timer := time.AfterFunc(t, c.handshakeExpired)
+func (c *Conn) runTimed(ctx context.Context, tr *ClientTrace) *HandshakeError {
+	if d, ok := c.handshakeBudget(ctx); ok {
+		timer := time.AfterFunc(d, c.handshakeExpired)
 		defer timer.Stop()
 	}
 	return c.h.run(ctx, c.conn, tr)
@@ -455,25 +491,21 @@ func (c *Conn) endIOLocked(ctx context.Context) {
 	}
 }
 
-func (c *Conn) blameAbortLocked(he *HandshakeError) *HandshakeError {
-	switch {
-	case c.abortErr == nil:
-	case he == nil:
-		he = &HandshakeError{c.h.replyStage(), c.abortErr}
-	case !isServerMsgErr(he.Err):
-		he.Err = c.abortErr
+// claimLocked moves to phaseSending, choosing the hooks unless a dial did.
+func (c *Conn) claimLocked(ctx context.Context) {
+	c.phase = phaseSending
+	if c.trace == nil {
+		c.trace = newTracer(ctx, c.configTrace)
 	}
-	return he
 }
 
 func (c *Conn) claim(ctx context.Context, op string) (mustSend bool, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.checkLocked(op); err != nil || c.claimed {
+	if err := c.checkLocked(op); err != nil || c.phase != phaseIdle {
 		return false, err
 	}
-	c.claimed = true
-	c.setTraceLocked(ctx)
+	c.claimLocked(ctx)
 	c.broadcastLocked()
 	return true, nil
 }
@@ -486,46 +518,37 @@ func (c *Conn) sendAlone(ctx context.Context, op string) error {
 	return err
 }
 
+// send writes b, the handshake and maybe data, for the call that claimed it.
+// WroteHandshake runs before the handshake can end here, and a reader that
+// ended it meanwhile left HandshakeDone to send (owed), so it runs last.
 func (c *Conn) send(b []byte) (int, error) {
 	n, werr := firstWrite(c.conn, b)
 	c.h.wipe(b)
 	hs := len(c.h.out)
+	c.trace.wroteHandshake(werr) // c.trace was set by claim on this goroutine
 	c.mu.Lock()
-	c.written = true
-	tr := c.trace
+	owed := c.done // claim saw it not done
+	c.phase = phaseSent
 	if werr != nil && n < hs {
-		cause := werr
-		if c.abortErr != nil {
-			cause = c.abortErr
-		}
-		he := &HandshakeError{c.h.writeStage(n), cause}
-		hook := c.finishLocked(he)
+		he := c.blame(&HandshakeError{c.h.writeStage(n), werr}, c.abortErr, time.Time{}, nil)
+		hook := c.endLocked(he) || owed
 		if c.err == nil { // the replies came first, yet the proxy lacks the request
 			c.err = c.opError(he)
-			c.readReady.Store(false)
-			c.writeReady.Store(false)
+			c.storeReadyLocked()
 		}
 		err := c.err
-		c.mu.Unlock()
-		tr.wroteHandshake(werr)
-		if hook {
-			tr.handshakeDone(err)
-		}
+		c.unlockDone(hook)
 		return 0, err
 	}
-	if c.err == nil && !c.closed {
-		c.writeReady.Store(true)
-	}
-	c.broadcastLocked()
-	c.settleUnlock()
-	tr.wroteHandshake(werr)
+	c.storeReadyLocked()
+	c.unlockDone(c.settleLocked() || owed)
 	return n - hs, c.ioErr("write", werr)
 }
 
 func (c *Conn) waitWritten(op string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for !c.written && !c.done && !c.closed {
+	for c.phase != phaseSent && !c.done && !c.closed {
 		c.waitLocked(time.Time{})
 	}
 	return c.checkLocked(op)
@@ -538,8 +561,8 @@ func (c *Conn) awaitReplies(ctx context.Context, op string) error {
 		return err
 	}
 	var replyDeadline time.Time
-	if t := c.replyWait(ctx); t > 0 {
-		replyDeadline = time.Now().Add(t)
+	if d, ok := c.replyBudget(ctx); ok {
+		replyDeadline = time.Now().Add(d)
 	}
 	if mustRead, err := c.claimReadLocked(op); !mustRead {
 		c.mu.Unlock()
@@ -554,17 +577,14 @@ func (c *Conn) awaitReplies(ctx context.Context, op string) error {
 	c.mu.Lock()
 	c.endIOLocked(ctx)
 	c.clearReplyDeadlineLocked()
-	hook := c.finishLocked(c.replyErrLocked(he, replyDeadline))
-	err, herr := c.checkLocked(op), c.err
-	c.mu.Unlock()
-	if hook {
-		tr.handshakeDone(herr)
-	}
+	hook := c.endLocked(c.blame(he, c.abortErr, replyDeadline, os.ErrDeadlineExceeded))
+	err := c.checkLocked(op)
+	c.unlockDone(hook)
 	return err
 }
 
 func (c *Conn) waitClaimedLocked(op string) error {
-	for !c.claimed && !c.done && !c.closed {
+	for c.phase == phaseIdle && !c.done && !c.closed {
 		if !c.readDeadline.IsZero() && !time.Now().Before(c.readDeadline) {
 			return c.connErr(op, os.ErrDeadlineExceeded)
 		}
@@ -578,7 +598,7 @@ func (c *Conn) claimReadLocked(op string) (mustRead bool, err error) {
 		if err := c.checkLocked(op); err != nil || c.done {
 			return false, err
 		}
-		if c.abortErr != nil && c.written && !c.busy {
+		if c.abortErr != nil && c.phase == phaseSent && !c.busy {
 			c.settleUnlock()
 			c.mu.Lock()
 			continue
@@ -607,25 +627,33 @@ func (c *Conn) clearReplyDeadlineLocked() {
 	}
 }
 
-func (c *Conn) replyErrLocked(he *HandshakeError, t time.Time) *HandshakeError {
+// blame picks the error of a failed (he) or interrupted (he nil) handshake.
+// A server message stands. Else cause, if any (cancellation, Close, the
+// handshake timer), explains it; else expired replaces a timeout of the
+// handshake's own deadline dl, unless the caller's read deadline came first.
+func (c *Conn) blame(he *HandshakeError, cause error, dl time.Time, expired error) *HandshakeError {
 	switch {
-	case c.abortErr != nil && he == nil:
-		he = &HandshakeError{c.h.replyStage(), c.abortErr}
-	case c.abortErr != nil && !isServerMsgErr(he.Err):
-		he.Err = c.abortErr
-	case he != nil && c.isReplyTimeout(he.Err, t):
-		he.Err = os.ErrDeadlineExceeded
+	case he != nil && isServerMsgErr(he.Err):
+	case cause != nil:
+		if he == nil {
+			he = &HandshakeError{Stage: c.h.readStage}
+		}
+		he.Err = cause
+	case he != nil && c.expired(he.Err, dl):
+		he.Err = expired
 	}
 	return he
 }
 
-// isReplyTimeout tells the reply deadline t from the caller's read deadline.
-func (c *Conn) isReplyTimeout(err error, t time.Time) bool {
-	return !t.IsZero() && isTimeout(err) && !time.Now().Before(t) &&
-		(c.readDeadline.IsZero() || t.Before(c.readDeadline))
+func (c *Conn) expired(err error, dl time.Time) bool {
+	return !dl.IsZero() && neterr.IsTimeout(err) && !time.Now().Before(dl) &&
+		(c.readDeadline.IsZero() || dl.Before(c.readDeadline))
 }
 
 func (c *Conn) abortWith(err error) {
+	if c.conn == nil {
+		return
+	}
 	c.mu.Lock()
 	if c.done || c.abortErr != nil {
 		c.mu.Unlock()
@@ -638,12 +666,20 @@ func (c *Conn) abortWith(err error) {
 
 // settleUnlock fails an aborted handshake no call is working on, wakes
 // waiters and unlocks c.mu.
-func (c *Conn) settleUnlock() {
-	hook := false
-	if c.abortErr != nil && c.claimed && c.written && !c.busy {
-		hook = c.finishLocked(&HandshakeError{c.h.readStage, c.abortErr})
+func (c *Conn) settleUnlock() { c.unlockDone(c.settleLocked()) }
+
+// settleLocked is settleUnlock without the unlock: it reports whether
+// HandshakeDone must run.
+func (c *Conn) settleLocked() (hook bool) {
+	if c.abortErr != nil && c.phase == phaseSent && !c.busy {
+		hook = c.endLocked(c.blame(nil, c.abortErr, time.Time{}, nil))
 	}
 	c.broadcastLocked()
+	return hook
+}
+
+// unlockDone unlocks c.mu, then runs HandshakeDone if hook.
+func (c *Conn) unlockDone(hook bool) {
 	tr, err := c.trace, c.err
 	c.mu.Unlock()
 	if hook {
@@ -651,46 +687,56 @@ func (c *Conn) settleUnlock() {
 	}
 }
 
-// finishLocked reports whether HandshakeDone must run.
-func (c *Conn) finishLocked(he *HandshakeError) bool {
-	if c.done {
+// endLocked ends the handshake, established if he is nil, unless it is over;
+// it reports whether HandshakeDone must run now: whether the handshake was
+// written. While it is being written (ModeEarly), send runs HandshakeDone.
+func (c *Conn) endLocked(he *HandshakeError) bool {
+	switch {
+	case c.done:
 		return false
+	case he == nil:
+		c.establishLocked(c.h.bound)
+	default:
+		c.failLocked(he)
 	}
-	c.done = true
-	c.broadcastLocked()
-	if he != nil {
-		c.err = c.opError(he)
-		c.writeReady.Store(false)
-		// Unblock other calls' handshake I/O: they return c.err.
-		if c.busy {
-			c.conn.SetReadDeadline(time.Unix(1, 0))
-		}
-		if c.claimed && !c.written {
-			c.conn.SetWriteDeadline(time.Unix(1, 0))
-		}
-		return c.claimed
-	}
-	c.bound = c.h.bound
-	if !c.closed {
-		c.readReady.Store(true)
-		c.writeReady.Store(c.written)
-	}
-	return c.claimed
+	return c.phase == phaseSent
 }
 
-func (c *Conn) setTraceLocked(ctx context.Context) {
-	if !c.traceSet {
-		c.trace, c.traceSet = newTracer(ctx, c.configTrace), true
+func (c *Conn) establishLocked(bound wire.Addr) {
+	c.done, c.bound = true, bound
+	c.broadcastLocked()
+	c.storeReadyLocked()
+}
+
+func (c *Conn) failLocked(he *HandshakeError) {
+	c.done, c.err = true, c.opError(he)
+	c.broadcastLocked()
+	c.storeReadyLocked()
+	// Unblock other calls' handshake I/O: they return c.err.
+	if c.busy {
+		c.conn.SetReadDeadline(aLongTimeAgo)
 	}
+	if c.phase == phaseSending {
+		c.conn.SetWriteDeadline(aLongTimeAgo)
+	}
+}
+
+// storeReadyLocked updates the fast paths from the state.
+func (c *Conn) storeReadyLocked() {
+	ok := c.err == nil && !c.closed
+	c.readReady.Store(ok && c.done)
+	c.writeReady.Store(ok && c.phase == phaseSent)
 }
 
 func (c *Conn) checkLocked(op string) error {
 	switch {
+	case c.conn == nil:
+		return c.noConn(op)
 	case !c.closed:
 		return c.err
-	case op != "socks connect":
+	case op != opConnect:
 		return c.connErr(op, net.ErrClosed)
-	case c.claimed:
+	case c.phase != phaseIdle:
 		return c.opError(&HandshakeError{c.h.readStage, net.ErrClosed})
 	}
 	return c.opError(&HandshakeError{c.h.writeStage(0), net.ErrClosed})
@@ -724,9 +770,9 @@ func (c *Conn) broadcastLocked() {
 }
 
 func (c *Conn) opError(he *HandshakeError) error {
-	e := &net.OpError{Op: cmp.Or(c.op, opConnect), Net: c.network, Err: he}
-	if c.proxy.IsValid() {
-		e.Source = c.proxy
+	e := &net.OpError{Op: c.op, Net: c.network, Err: he}
+	if proxy, ok := c.proxy(); ok {
+		e.Source = proxy
 	} else if c.conn != nil {
 		e.Source = c.conn.RemoteAddr()
 	}
@@ -736,12 +782,28 @@ func (c *Conn) opError(he *HandshakeError) error {
 	return e
 }
 
+// proxy is the Dialer's ProxyAddr, parsed on the error path only.
+func (c *Conn) proxy() (wire.Addr, bool) {
+	if c.proxyAddr == "" {
+		return wire.Addr{}, false
+	}
+	a, err := wire.ParseAddr(c.proxyAddr)
+	return a, err == nil
+}
+
 func (c *Conn) connErr(op string, err error) error {
 	return &net.OpError{Op: op, Net: c.network, Source: c.conn.LocalAddr(), Addr: c.conn.RemoteAddr(), Err: err}
 }
 
+// ioErr maps an I/O error after Close to net.ErrClosed.
 func (c *Conn) ioErr(op string, err error) error {
-	if err != nil && c.isShut.Load() && !errors.Is(err, net.ErrClosed) {
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
 		return c.connErr(op, net.ErrClosed)
 	}
 	return err
@@ -757,34 +819,32 @@ func (c *Conn) noConn(op string) error {
 // defaultHandshakeTimeout is a var for tests.
 var defaultHandshakeTimeout = 30 * time.Second
 
-func handshakeCtx(ctx context.Context, t time.Duration) (_ context.Context, cancel context.CancelFunc) {
-	if t == 0 {
-		if hasDeadline(ctx) {
-			return ctx, nil
-		}
-		t = defaultHandshakeTimeout
-	}
-	if t < 0 {
-		return ctx, nil
-	}
-	return context.WithTimeout(ctx, t)
-}
-
-func (c *Conn) replyWait(ctx context.Context) time.Duration {
-	if c.replyTimeout > 0 {
-		return c.replyTimeout
-	}
-	return c.handshakeWait(ctx)
-}
-
-func (c *Conn) handshakeWait(ctx context.Context) time.Duration {
+// handshakeBudget is HandshakeTimeout's bound on a handshake under ctx: zero
+// is defaultHandshakeTimeout unless ctx has a deadline; negative is none.
+func (c *Conn) handshakeBudget(ctx context.Context) (time.Duration, bool) {
 	switch t := c.handshakeTimeout; {
 	case t > 0:
-		return t
+		return t, true
 	case t < 0 || hasDeadline(ctx):
-		return 0
+		return 0, false
 	}
-	return defaultHandshakeTimeout
+	return defaultHandshakeTimeout, true
+}
+
+// replyBudget is ReplyTimeout, else the handshake budget.
+func (c *Conn) replyBudget(ctx context.Context) (time.Duration, bool) {
+	if c.replyTimeout > 0 {
+		return c.replyTimeout, true
+	}
+	return c.handshakeBudget(ctx)
+}
+
+// handshakeCtx bounds ctx by the handshake budget.
+func (c *Conn) handshakeCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if d, ok := c.handshakeBudget(ctx); ok {
+		return context.WithTimeout(ctx, d)
+	}
+	return ctx, nil
 }
 
 func (c *Conn) handshakeExpired() { c.abortWith(context.DeadlineExceeded) }
@@ -801,44 +861,34 @@ func earliest(a, b time.Time) time.Time {
 	return a
 }
 
-func (c *Conn) handshakeOver(ctx context.Context, conn net.Conn, tr tracer, closeOnErr func() error, dl time.Time) error {
+// handshakeOver runs a Dialer's or Request's handshake on conn, closing it on
+// error if closeOnErr; dl is conn's deadline, the HandshakeTimeout.
+func (c *Conn) handshakeOver(ctx context.Context, conn net.Conn, closeOnErr bool, dl time.Time) error {
 	var stop func() bool
 	if ctx.Done() != nil {
 		stop = context.AfterFunc(ctx, func() { unblock(conn) })
 	}
-	wrote, he := c.h.run(ctx, conn, tr)
-	fired := stop != nil && !stop()
-	he = c.blameCtx(ctx, he, fired, dl)
+	he := c.h.run(ctx, conn, c.trace)
+	var cause error
+	if stop != nil && !stop() { // it fired
+		cause = ctx.Err()
+	}
 	var err error
-	if he != nil {
-		if closeOnErr != nil {
-			closeOnErr()
+	if he = c.blame(he, cause, dl, context.DeadlineExceeded); he != nil {
+		if closeOnErr {
+			conn.Close()
 		}
 		err = c.opError(he)
 	}
-	if wrote && (err != nil || !c.doneAfterRelay) {
-		tr.handshakeDone(err)
+	if err != nil || !c.doneAfterRelay {
+		c.trace.handshakeDone(err)
 	}
 	return err
 }
 
-// blameCtx blames ctx or the deadline dl for a failure they may have caused.
-func (c *Conn) blameCtx(ctx context.Context, he *HandshakeError, fired bool, dl time.Time) *HandshakeError {
-	switch {
-	case fired && (he == nil || !isServerMsgErr(he.Err)):
-		if he == nil {
-			he = &HandshakeError{Stage: c.h.readStage}
-		}
-		he.Err = ctx.Err()
-	case he != nil && !dl.IsZero() && !isServerMsgErr(he.Err) && isTimeout(he.Err) && !time.Now().Before(dl):
-		he.Err = context.DeadlineExceeded
-	}
-	return he
-}
-
 // unblock fails pending I/O on conn: a past deadline, or Close.
 func unblock(conn net.Conn) {
-	if conn.SetDeadline(time.Unix(1, 0)) != nil {
+	if conn.SetDeadline(aLongTimeAgo) != nil {
 		conn.Close()
 	}
 }

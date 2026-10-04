@@ -4,15 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/neterr"
+	"github.com/dengaleev/glitch-gate/go/socks0/internal/sockopt"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
@@ -98,18 +100,18 @@ func (d *Dialer) associate(ctx context.Context, network string, target wire.Addr
 	if err != nil {
 		return nil, err
 	}
-	conn, tr, err := d.connect(ctx, c)
+	conn, err := d.connect(ctx, c)
 	if err != nil {
 		if pre != nil {
 			pre.Close()
 		}
 		return nil, err
 	}
-	u, err := d.openRelay(ctx, c, conn, tr, pre)
+	u, err := d.openRelay(ctx, c, conn, pre)
 	if err != nil {
 		return nil, err
 	}
-	u.bound, u.tr, u.family = c.h.bound, tr, network[len(network)-1]
+	u.bound, u.tr, u.network = c.h.bound, c.trace, network
 	return u.start(conn, resolved), nil
 }
 
@@ -132,26 +134,26 @@ func (d *Dialer) setRequestDST(ctx context.Context, c *Conn, network string, req
 	return pre, nil
 }
 
-func (d *Dialer) openRelay(ctx context.Context, c *Conn, control net.Conn, tr tracer, pre net.PacketConn) (*udpState, error) {
-	rctx, cancel := handshakeCtx(ctx, c.handshakeTimeout)
-	s, err := d.relay(rctx, control, c.h.bound, tr, pre)
+// openRelay ends the handshake: HandshakeDone runs after the relay dial.
+func (d *Dialer) openRelay(ctx context.Context, c *Conn, control net.Conn, pre net.PacketConn) (*udpState, error) {
+	rctx, cancel := c.handshakeCtx(ctx)
+	s, err := d.relay(rctx, control, c.h.bound, c.trace, pre)
 	if cancel != nil {
 		cancel()
 	}
 	if err != nil {
 		control.Close()
 		err = c.opError(&HandshakeError{StageRelayDial, ctxErr(ctx, err)})
-		tr.handshakeDone(err)
-		return nil, err
+		s = nil
 	}
-	tr.handshakeDone(nil)
-	return s, nil
+	c.trace.handshakeDone(err)
+	return s, err
 }
 
 func (d *Dialer) prebind(ctx context.Context, network string) (net.PacketConn, error) {
 	listen := d.RelayListen
 	if listen == nil {
-		listen = listenNoBroadcast
+		listen = sockopt.ListenNoBroadcast
 	}
 	pc, err := listen(ctx, network, ":0")
 	if err = dialErr(pc, err, errNoRelayConn); err != nil {
@@ -164,7 +166,7 @@ func (d *Dialer) prebind(ctx context.Context, network string) (net.PacketConn, e
 	return pc, nil
 }
 
-func (d *Dialer) relay(ctx context.Context, control net.Conn, bound wire.Addr, tr tracer, pre net.PacketConn) (*udpState, error) {
+func (d *Dialer) relay(ctx context.Context, control net.Conn, bound wire.Addr, tr *ClientTrace, pre net.PacketConn) (*udpState, error) {
 	ra, proxyIP, err := d.relayAddr(ctx, control, bound)
 	if err != nil {
 		if pre != nil {
@@ -186,8 +188,11 @@ func (d *Dialer) relay(ctx context.Context, control net.Conn, bound wire.Addr, t
 
 // relayAddr applies the relay address policy (security: hostile BND).
 func (d *Dialer) relayAddr(ctx context.Context, control net.Conn, bound wire.Addr) (ra wire.Addr, proxyIP netip.Addr, err error) {
-	ra, err = d.substitute(ctx, bound, control, d.RelayUseProxyHost, d.RelayDial != nil && d.ProxyDial != nil)
-	proxyIP = d.proxyIP(control)
+	proxy := d.proxyHost()
+	ra, err = d.substitute(ctx, bound, control, proxy, d.RelayUseProxyHost, d.RelayDial != nil && d.ProxyDial != nil)
+	if proxyIP = proxy.ip; !proxyIP.IsValid() {
+		proxyIP = remoteIP(control)
+	}
 	if err == nil && ra.IP().IsValid() {
 		err = checkRelay(ra.IP(), proxyIP)
 	}
@@ -237,27 +242,25 @@ func (d *Dialer) listenRelay(ctx context.Context, s *udpState, network string, r
 // substitute replaces an unspecified (or, if force, any) BND IP with the
 // proxy's host: ProxyAddr's IP; else, without ProxyDial, the control peer's
 // IP; else ProxyAddr's name (resolved unless keepName).
-func (d *Dialer) substitute(ctx context.Context, bound wire.Addr, control net.Conn, force, keepName bool) (wire.Addr, error) {
+func (d *Dialer) substitute(ctx context.Context, bound wire.Addr, control net.Conn, proxy proxyHost, force, keepName bool) (wire.Addr, error) {
 	ip := bound.IP()
-	if !force && !ip.IsUnspecified() {
+	switch {
+	case !force && !ip.IsUnspecified():
 		return bound, nil
-	}
-	host, _, err := net.SplitHostPort(d.ProxyAddr)
-	if err != nil {
-		return wire.Addr{}, err
-	}
-	if proxyIP, err := netip.ParseAddr(host); err == nil {
-		return addrPort(proxyIP, bound.Port()), nil
+	case proxy.err != nil:
+		return wire.Addr{}, proxy.err
+	case proxy.ip.IsValid():
+		return addrPort(proxy.ip, bound.Port()), nil
 	}
 	peer := remoteIP(control)
 	if d.ProxyDial == nil && peer.IsValid() && (!ip.Is4() || peer.Is4()) {
 		return addrPort(peer, bound.Port()), nil
 	}
-	name, err := wire.ParseAddr(net.JoinHostPort(host, fmt.Sprint(bound.Port())))
+	name, err := nameAddr(proxy.name, bound.Port())
 	if err != nil || keepName {
 		return name, err
 	}
-	return d.resolveProxyHost(ctx, name, bound.IP(), peer)
+	return d.resolveProxyHost(ctx, name, ip, peer)
 }
 
 func (d *Dialer) resolveProxyHost(ctx context.Context, name wire.Addr, boundIP, peer netip.Addr) (wire.Addr, error) {
@@ -268,11 +271,20 @@ func (d *Dialer) resolveProxyHost(ctx context.Context, name wire.Addr, boundIP, 
 		}
 		return addrPort(peer, name.Port()), nil
 	}
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", name.Name())
+	ips, err := lookupIPs(ctx, name.Name())
 	if err != nil {
 		return wire.Addr{}, err
 	}
 	return addrPort(pickRelayIP(ips, peer, boundIP), name.Port()), nil
+}
+
+// lookupIPs resolves name with net.DefaultResolver, unmapping the IPs.
+func lookupIPs(ctx context.Context, name string) ([]netip.Addr, error) {
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", name)
+	for i := range ips {
+		ips[i] = ips[i].Unmap()
+	}
+	return ips, err
 }
 
 func remoteIP(control net.Conn) netip.Addr {
@@ -285,11 +297,8 @@ func remoteIP(control net.Conn) netip.Addr {
 // pickRelayIP prefers the control peer, but for an IPv4 BND only if IPv4:
 // 0.0.0.0 is an IPv4-only socket, while :: usually takes both families.
 func pickRelayIP(ips []netip.Addr, peer, bound netip.Addr) netip.Addr {
-	for i := range ips {
-		ips[i] = ips[i].Unmap()
-		if ips[i] == peer && (!bound.Is4() || peer.Is4()) {
-			return peer
-		}
+	if (!bound.Is4() || peer.Is4()) && slices.Contains(ips, peer) {
+		return peer
 	}
 	for _, ip := range ips {
 		if ip.Is4() == bound.Is4() {
@@ -300,18 +309,15 @@ func pickRelayIP(ips []netip.Addr, peer, bound netip.Addr) netip.Addr {
 }
 
 func resolveFirst(ctx context.Context, a wire.Addr, want4 bool) (wire.Addr, error) {
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", a.Name())
+	ips, err := lookupIPs(ctx, a.Name())
 	if err != nil {
 		return wire.Addr{}, err
 	}
 	ip := ips[0]
-	for _, i := range ips {
-		if i.Unmap().Is4() || !want4 {
-			ip = i
-			break
-		}
+	if i := slices.IndexFunc(ips, netip.Addr.Is4); want4 && i >= 0 {
+		ip = ips[i]
 	}
-	return addrPort(ip.Unmap(), a.Port()), nil
+	return addrPort(ip, a.Port()), nil
 }
 
 // UDPConn is a UDP association (TCP control conn + UDP relay socket); a
@@ -336,20 +342,20 @@ type UDPConn struct {
 // udpState is the association; the watcher holds only it, so that an
 // unreachable UDPConn can be cleaned up.
 type udpState struct {
-	control      net.Conn
-	relay        net.Conn       // connected relay, or nil
-	pc           net.PacketConn // unconnected relay, or nil
-	upc          *net.UDPConn   // pc, if it is one: no allocation per datagram
-	relayAP      netip.AddrPort // pc's destination; answers come from its IP
-	relayAddr    net.Addr
-	laddr        net.Addr
-	target       wire.Addr // zero if unconnected
-	raddr        net.Addr  // target as a *net.UDPAddr or wire.Addr; nil if unconnected
-	filterSource bool      // drop datagrams whose source is not target
-	family       byte      // '4', '6': the IP targets allowed
-	bound        wire.Addr
-	maxLen       int // of a datagram to the relay
-	tr           tracer
+	control   net.Conn       // nil: dead, nothing open (NewUDPConn without both conns)
+	relay     net.Conn       // connected relay, or nil
+	pc        net.PacketConn // unconnected relay, or nil
+	sock      relaySocket    // relay or pc
+	upc       *net.UDPConn   // pc, if it is one: no allocation per datagram
+	relayAP   netip.AddrPort // pc's destination; answers come from its IP
+	relayAddr net.Addr
+	laddr     net.Addr
+	target    wire.Addr // zero if unconnected
+	raddr     net.Addr  // target as a *net.UDPAddr or wire.Addr; nil if unconnected
+	network   string    // "udp4", "udp6": the IP targets allowed
+	bound     wire.Addr
+	maxLen    int // of a datagram to the relay
+	tr        *ClientTrace
 
 	rmu  sync.Mutex
 	rbuf []byte
@@ -363,6 +369,15 @@ type udpState struct {
 	relayOnce sync.Once
 }
 
+// relaySocket is what net.Conn and net.PacketConn share.
+type relaySocket interface {
+	Close() error
+	LocalAddr() net.Addr
+	SetDeadline(time.Time) error
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
 var errNoUDPConn = &HandshakeError{StageConfig, errNoConn}
 
 // NewUDPConn makes a UDPConn from a caller's association (see Request):
@@ -371,7 +386,7 @@ var errNoUDPConn = &HandshakeError{StageConfig, errNoConn}
 // If either conn is nil the other is closed and the UDPConn is dead, with
 // errors at StageConfig.
 func NewUDPConn(control, relay net.Conn, target wire.Addr) *UDPConn {
-	s := new(udpState)
+	s := &udpState{network: "udp"}
 	if control == nil || relay == nil {
 		for _, c := range [...]net.Conn{control, relay} {
 			if c != nil {
@@ -388,30 +403,26 @@ func NewUDPConn(control, relay net.Conn, target wire.Addr) *UDPConn {
 func (s *udpState) start(control net.Conn, target wire.Addr) *UDPConn {
 	s.control, s.target, s.done = control, target, make(chan struct{})
 	if target.IsValid() {
-		if target.IsName() {
-			s.raddr = target
-		} else {
-			s.raddr, s.filterSource = net.UDPAddrFromAddrPort(netip.AddrPortFrom(target.IP(), target.Port())), true
-		}
+		s.raddr = netAddr(target, true)
 	}
 	s.maxLen = 65535 - 8 - 20
 	switch {
-	case s.err != nil:
+	case s.dead():
 		close(s.done)
 		return &UDPConn{s: s}
 	case s.relay != nil:
-		s.laddr, s.relayAddr = s.relay.LocalAddr(), s.relay.RemoteAddr()
+		s.sock, s.relayAddr = s.relay, s.relay.RemoteAddr()
 		if ua, ok := s.relayAddr.(*net.UDPAddr); ok && ua.AddrPort().Addr().Unmap().Is6() {
 			s.maxLen = 65535 - 8
 		}
-	default:
-		s.relayAP = netip.AddrPortFrom(s.relayAP.Addr().Unmap(), s.relayAP.Port())
-		s.laddr, s.relayAddr = s.pc.LocalAddr(), net.UDPAddrFromAddrPort(s.relayAP)
+	default: // relayAP is from a wire.Addr: unmapped
+		s.sock, s.relayAddr = s.pc, net.UDPAddrFromAddrPort(s.relayAP)
 		s.upc, _ = s.pc.(*net.UDPConn)
 		if s.relayAP.Addr().Is6() {
 			s.maxLen = 65535 - 8
 		}
 	}
+	s.laddr = s.sock.LocalAddr()
 	go s.watch()
 	c := &UDPConn{s: s}
 	// In a goroutine: close waits for the watcher, and cleanups must not
@@ -436,14 +447,10 @@ func (s *udpState) watch() {
 }
 
 func (s *udpState) closeRelay() {
-	s.relayOnce.Do(func() {
-		if s.relay != nil {
-			s.relay.Close()
-		} else {
-			s.pc.Close()
-		}
-	})
+	s.relayOnce.Do(func() { s.sock.Close() })
 }
+
+func (s *udpState) dead() bool { return s.control == nil }
 
 const closeWait = time.Second
 
@@ -456,10 +463,10 @@ func (s *udpState) close() error {
 		s.err = net.ErrClosed
 	}
 	s.mu.Unlock()
-	if s.control == nil { // NewUDPConn without both conns: nothing open
+	if s.dead() {
 		return nil
 	}
-	s.control.SetReadDeadline(time.Unix(1, 0))
+	s.control.SetReadDeadline(aLongTimeAgo)
 	s.control.Close()
 	s.closeRelay()
 	t := time.NewTimer(closeWait)
@@ -496,10 +503,7 @@ func (c *UDPConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	if from.IsName() {
-		return n, from, nil
-	}
-	return n, net.UDPAddrFromAddrPort(netip.AddrPortFrom(from.IP(), from.Port())), nil
+	return n, netAddr(from, true), nil
 }
 
 // ReadFromAddr is ReadFrom without allocation (except a name's string).
@@ -579,42 +583,28 @@ func (c *UDPConn) SetWriteDeadline(t time.Time) error { return c.s.deadline(t, f
 // SyscallConn returns the relay socket's raw conn, or an error matching
 // errors.ErrUnsupported.
 func (c *UDPConn) SyscallConn() (syscall.RawConn, error) {
-	var x any = c.s.relay
-	if c.s.relay == nil {
-		x = c.s.pc
-	}
-	if sc, ok := x.(syscall.Conn); ok {
+	if sc, ok := c.s.sock.(syscall.Conn); ok {
 		return sc.SyscallConn()
 	}
 	return nil, c.s.newErr("raw-conn", nil, errors.ErrUnsupported)
 }
 
 func (s *udpState) deadline(t time.Time, read, write bool) error {
-	type deadliner interface {
-		SetDeadline(time.Time) error
-		SetReadDeadline(time.Time) error
-		SetWriteDeadline(time.Time) error
-	}
-	var d deadliner = s.relay
 	switch {
-	case s.relay == nil && s.pc == nil:
+	case s.dead():
 		return s.newErr("set", nil, errNoUDPConn)
-	case s.relay == nil:
-		d = s.pc
-	}
-	switch {
 	case read && write:
-		return d.SetDeadline(t)
+		return s.sock.SetDeadline(t)
 	case read:
-		return d.SetReadDeadline(t)
+		return s.sock.SetReadDeadline(t)
 	}
-	return d.SetWriteDeadline(t)
+	return s.sock.SetWriteDeadline(t)
 }
 
 const maxRelayDatagram = 65535
 
 func (s *udpState) readFrom(b []byte) (int, wire.Addr, error) {
-	if s.relay == nil && s.pc == nil {
+	if s.dead() {
 		return 0, wire.Addr{}, s.newErr("read", nil, errNoUDPConn)
 	}
 	s.rmu.Lock()
@@ -637,7 +627,7 @@ func (s *udpState) readFrom(b []byte) (int, wire.Addr, error) {
 			s.drop(wire.Addr{}, err)
 		case frag != 0:
 			s.drop(from, ErrFragment)
-		case s.filterSource && from != s.target:
+		case s.target.IP().IsValid() && from != s.target: // an IP target only
 			s.drop(from, ErrWrongSource)
 		default:
 			return copy(b, buf[hn:n]), from, nil
@@ -675,10 +665,7 @@ func (s *udpState) drop(from wire.Addr, err error) {
 	if !s.tr.hasDroppedHook() {
 		return
 	}
-	if err == wire.ErrIncomplete {
-		err = &ProtocolError{Stage: wire.StageUDPHeader, Err: io.ErrUnexpectedEOF}
-	}
-	s.tr.droppedDatagram(from, err)
+	s.tr.droppedDatagram(from, neterr.Truncated(wire.StageUDPHeader, err))
 }
 
 func (s *udpState) writeTo(b []byte, to wire.Addr, addr net.Addr) (int, error) {
@@ -688,14 +675,14 @@ func (s *udpState) writeTo(b []byte, to wire.Addr, addr net.Addr) (int, error) {
 		}
 		return addr
 	}
-	switch ip := to.IP(); {
+	switch {
 	case !to.IsValid():
 		return 0, s.newErr("write", addr, syscall.EINVAL)
-	case s.family == '4' && ip.Is6(), s.family == '6' && ip.Is4():
-		return 0, s.newErr("write", errAddr(), &net.AddrError{Err: "address family mismatch for udp" + string(s.family), Addr: to.String()})
+	case !matchesFamily(s.network, to.IP()):
+		return 0, s.newErr("write", errAddr(), familyErr(s.network, to.String()))
 	case len(b) > s.maxLen-wire.UDPHeaderLen(to):
 		return 0, s.newErr("write", errAddr(), errMsgSize)
-	case s.relay == nil && s.pc == nil:
+	case s.dead():
 		return 0, s.newErr("write", errAddr(), errNoUDPConn)
 	}
 	s.wmu.Lock()

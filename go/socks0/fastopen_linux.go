@@ -14,7 +14,12 @@ const FastOpenSupported = true
 
 const tcpFastOpenConnect = 30 // TCP_FASTOPEN_CONNECT, Linux 4.11
 
-func fastOpenDial(d *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
+// FastOpenDial returns a Dialer.ProxyDial dialing like d (nil: zero) with TCP
+// Fast Open (Linux TCP_FASTOPEN_CONNECT); no fallback, and elsewhere every
+// call fails matching errors.ErrUnsupported. ConnectDone(nil) no longer
+// proves reachability, so never use it for probes. Security: SYN data may be
+// replayed (RFC 7413 §6): a duplicate CONNECT and, in ModeEarly, early data.
+func FastOpenDial(d *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	var nd net.Dialer
 	if d != nil {
 		nd = *d

@@ -122,25 +122,14 @@ func (s *server) authenticate(c net.Conn, r *bufio.Reader) error {
 
 // readConnect consumes VER CMD RSV ATYP DST.ADDR DST.PORT, ignoring the target.
 func readConnect(r *bufio.Reader, buf []byte) error {
-	if _, err := io.ReadFull(r, buf[:4]); err != nil {
+	if _, err := io.ReadFull(r, buf[:5]); err != nil { // up to DST.ADDR[0]
 		return err
 	}
-	var addrLen int
-	switch buf[3] {
-	case 1:
-		addrLen = net.IPv4len
-	case 4:
-		addrLen = net.IPv6len
-	case 3: // domain
-		n, err := r.ReadByte()
-		if err != nil {
-			return err
-		}
-		addrLen = int(n)
-	default:
+	addrLen, ok := s5.AddrLen(buf[3], buf[4])
+	if !ok {
 		return errors.New("bad address type")
 	}
-	_, err := r.Discard(addrLen + 2)
+	_, err := r.Discard(addrLen - 1 + 2)
 	return err
 }
 

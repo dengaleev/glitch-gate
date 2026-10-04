@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"strings"
 	"syscall"
+
+	"github.com/dengaleev/glitch-gate/go/socks0"
 )
 
 // Filter decides whether a built-in handler may reach addr (resolved, unmapped, zone-free) for r;
@@ -59,6 +61,11 @@ func (f Filter) checkDial(r *Request, network, address string) error {
 	if err != nil {
 		return &DeniedError{Reason: "unparsable address"}
 	}
+	return f.vet(r, network, normalize(ap))
+}
+
+// vet applies f and the own-host check to ap (normalized) before any packet is sent to it.
+func (f Filter) vet(r *Request, network string, ap netip.AddrPort) error {
 	if err := f.allow(r, network, ap); err != nil {
 		return err
 	}
@@ -72,13 +79,43 @@ func (f Filter) allow(r *Request, network string, ap netip.AddrPort) error {
 	return f(r, network, normalize(ap))
 }
 
-// checkOwnHost asks f again with LocalAddr set to remote if remote is this host. Under Happy
-// Eyeballs it runs concurrently: one call uses the conn's scratch, others allocate.
+// allowIP vets ip as a RESOLVE answer or a BIND peer: network ip4/6, port 0.
+func (f Filter) allowIP(r *Request, ip netip.Addr) error {
+	return f.allow(r, ipNetwork(ip), netip.AddrPortFrom(ip, 0))
+}
+
+// lookupAllowed resolves name and appends to dst the addresses f allows for network(ip) and port,
+// normalized and in order, stopping once len(dst) reaches a non-zero cap(dst). denial is f's first
+// error, err the lookup's.
+func (f Filter) lookupAllowed(ctx context.Context, res socks0.Resolver, r *Request, name string, port uint16, network func(netip.Addr) string, dst []netip.Addr) (_ []netip.Addr, denial, err error) {
+	ips, err := res.LookupNetIP(ctx, "ip", name)
+	limit := cap(dst)
+	for _, ip := range ips {
+		ip = ip.Unmap().WithZone("")
+		if ferr := f.allow(r, network(ip), netip.AddrPortFrom(ip, port)); ferr != nil {
+			if denial == nil {
+				denial = ferr
+			}
+			continue
+		}
+		if dst = append(dst, ip); len(dst) == limit {
+			break
+		}
+	}
+	return dst, denial, err
+}
+
+func notFound(name string) error {
+	return &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
+}
+
+// checkOwnHost asks f again with LocalAddr set to remote if remote is this host. local and remote
+// are normalized. Under Happy Eyeballs it runs concurrently: one call uses the conn's scratch,
+// others allocate.
 func (f Filter) checkOwnHost(r *Request, network string, local, remote netip.AddrPort, remoteAddr net.Addr) error {
-	if !local.IsValid() || normalize(local).Addr() != normalize(remote).Addr() {
+	if !local.IsValid() || local.Addr() != remote.Addr() {
 		return nil
 	}
-	remote = normalize(remote)
 	var rr *Request
 	if r != nil && r.sc != nil && r.sc.scratch.busy.CompareAndSwap(false, true) {
 		scr := &r.sc.scratch
