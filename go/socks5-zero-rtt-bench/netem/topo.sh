@@ -11,13 +11,13 @@
 # - SPIN=1: a SCHED_IDLE spinner per CPU keeps colima vCPUs awake; idle ones
 #   fire netem timers 0–6 ms late (~0.02 ms with spinners).
 #
-# Usage: topo.sh [bench rtt flags...]   bench ready + bench rtt
+# Usage: topo.sh [bench rtt flags...]   bench ready + bench rtt per $SERVER
 #        topo.sh check                  measure the topology itself
 set -eu
 
 PT_RTT=${PT_RTT:-20} # proxy↔target RTT, ms
 SPIN=${SPIN:-1}
-SERVER=${SERVER:-} # default: bench proxy -pick
+SERVER=${SERVER:-} # proxy name(s), comma-separated; default: bench proxy -pick
 USER_=bench PASS_=bench
 C=10.0.1.1 P=10.0.1.2 PT=10.0.2.1 T=10.0.2.2
 
@@ -115,18 +115,26 @@ if [ "${1:-}" = check ]; then
 	exit 0
 fi
 
+# SERVER: one proxy name, or several separated by commas: one clients table each.
 SERVER=${SERVER:-$(bench proxy -pick)}
 at target bench target -listen $T:7 &
 tpid=$!
-at proxy bench proxy -listen $P:1080 -server "$SERVER" &
-p0=$!
-at proxy bench proxy -listen $P:1081 -server "$SERVER" -user $USER_ -pass $PASS_ &
-p1=$!
 wait_listen target 7 $tpid
-wait_listen proxy 1080 $p0
-wait_listen proxy 1081 $p1
 
 bench ready
-echo
-at client bench rtt -proxy $P -target $T:7 -dev c0 -user $USER_ -pass $PASS_ \
-	-server "$SERVER" -pt-rtt $PT_RTT "$@"
+rest=$SERVER,
+while [ -n "$rest" ]; do
+	srv=${rest%%,*} rest=${rest#*,}
+	# Not via at(): $! must be the proxy itself, to kill it.
+	ip netns exec proxy bench proxy -listen $P:1080 -server "$srv" &
+	p0=$!
+	ip netns exec proxy bench proxy -listen $P:1081 -server "$srv" -user $USER_ -pass $PASS_ &
+	p1=$!
+	wait_listen proxy 1080 $p0
+	wait_listen proxy 1081 $p1
+	echo
+	at client bench rtt -proxy $P -target $T:7 -dev c0 -user $USER_ -pass $PASS_ \
+		-server "$srv" -pt-rtt $PT_RTT "$@"
+	kill $p0 $p1
+	wait $p0 $p1 2>/dev/null || true
+done

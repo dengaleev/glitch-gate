@@ -109,7 +109,7 @@ func TestEarlyData(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if want := c.Name == "ref L1+L2"; early != want {
+				if want := c.Name == "ref L1+L2" || c.Name == "socks0 L1+L2"; early != want {
 					t.Errorf("EarlyData = %v, want %v", early, want)
 				}
 			})
@@ -134,11 +134,11 @@ func TestReads(t *testing.T) {
 				n := <-reads
 				t.Logf("%d reads before the CONNECT reply", n)
 				switch c.Name {
-				case "ref L1", "ref L1+L2", "outline-sdk":
+				case "ref L1", "ref L1+L2", "outline-sdk", "socks0 L1", "socks0 L1+L2":
 					if n != 1 {
 						t.Errorf("reads = %d, want 1", n)
 					}
-				case "x/net/proxy": // one RTT per message
+				case "x/net/proxy", "socks0 L0": // one RTT per message
 					want := 2
 					if a.user != "" {
 						want = 3

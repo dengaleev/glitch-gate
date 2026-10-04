@@ -1,7 +1,10 @@
 # For netem/Dockerfile (BuildKit reads <Dockerfile>.dockerignore).
+# Context: the parent go/ dir; only the bench and socks0 modules.
 *
-!go.mod
-!go.sum
-!**/*.go
+!socks5-zero-rtt-bench/go.mod
+!socks5-zero-rtt-bench/go.sum
+!socks5-zero-rtt-bench/**/*.go
+!socks5-zero-rtt-bench/netem/topo.sh
+!socks0/go.mod
+!socks0/**/*.go
 **/*_test.go
-!netem/topo.sh

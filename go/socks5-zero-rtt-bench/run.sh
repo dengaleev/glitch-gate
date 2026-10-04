@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the netem image and runs the benchmark in it.
 # Args: `bench rtt` flags (e.g. -n 30 -rtts 0,20,80,200), or `check`.
-# Env: PT_RTT (proxy↔target ms, default 20), SERVER (proxy impl).
+# Env: PT_RTT (proxy↔target ms, default 20), SERVER (proxy impl; comma-separated:
+# one clients table each, e.g. SERVER=armon/go-socks5,socks0/server).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -11,7 +12,8 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 img=socks5-zero-rtt-bench
-docker build -q -f netem/Dockerfile -t "$img" . >/dev/null
+# Context: go/, so the build sees ../socks0 (go.mod replace).
+docker build -q -f netem/Dockerfile -t "$img" .. >/dev/null
 
 tty=
 [[ -t 1 ]] && tty=-t # live progress line
