@@ -35,7 +35,7 @@ func refL1L2(ctx context.Context, addr, user, pass, target string) (net.Conn, er
 	if err != nil {
 		return nil, err
 	}
-	return &earlyConn{Conn: c, user: user, hs: hs, replied: make(chan struct{})}, nil
+	return &earlyConn{Conn: c, user: user, hs: hs, hsSent: make(chan struct{}), replied: make(chan struct{})}, nil
 }
 
 // dialProxy connects to the proxy and encodes the pipelined handshake.
@@ -52,7 +52,7 @@ func dialProxy(ctx context.Context, addr, user, pass, target string) (net.Conn, 
 // earlyConn prepends the handshake to the first Write (or sends it alone if
 // Read comes first) and consumes the replies on the first Read. Write never
 // waits for them, and holds no lock, so a huge first Write can't block the
-// reader. A failed handshake surfaces from Read, and from Write once known.
+// reader; a later Write waits only until the handshake is on the wire. A failed handshake surfaces from Read, and from Write once known.
 // Safe for one reader and one writer.
 type earlyConn struct {
 	net.Conn
@@ -60,6 +60,7 @@ type earlyConn struct {
 	hs   []byte
 
 	handshakeSent atomic.Bool
+	hsSent        chan struct{} // closed once the handshake write returned
 
 	readOnce sync.Once
 	replied  chan struct{} // closed once replyErr is set
@@ -69,8 +70,10 @@ type earlyConn struct {
 func (c *earlyConn) Write(p []byte) (int, error) {
 	if c.handshakeSent.CompareAndSwap(false, true) {
 		n, err := c.Conn.Write(append(c.hs, p...))
+		close(c.hsSent)
 		return max(n-len(c.hs), 0), err
 	}
+	<-c.hsSent // Read won the race: don't overtake its handshake
 	select {
 	case <-c.replied:
 		if c.replyErr != nil {
@@ -83,7 +86,9 @@ func (c *earlyConn) Write(p []byte) (int, error) {
 
 func (c *earlyConn) Read(p []byte) (int, error) {
 	if c.handshakeSent.CompareAndSwap(false, true) {
-		if _, err := c.Conn.Write(c.hs); err != nil {
+		_, err := c.Conn.Write(c.hs)
+		close(c.hsSent)
+		if err != nil {
 			return 0, err
 		}
 	}

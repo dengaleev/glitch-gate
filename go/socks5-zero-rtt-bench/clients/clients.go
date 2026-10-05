@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 
+	"github.com/dengaleev/glitch-gate/go/socks0"
 	"github.com/go-gost/gosocks5"
 	gostclient "github.com/go-gost/gosocks5/client"
 	M "github.com/sagernet/sing/common/metadata"
@@ -36,6 +37,9 @@ var All = []Client{
 	{"go-gost/gosocks5", gost},
 	{"sagernet/sing", sing},
 	{"outline-sdk", outlineSDK},
+	{"socks0 L0", socks0Dial(socks0.ModeSequential)},
+	{"socks0 L1", socks0Dial(socks0.ModePipelined)},
+	{"socks0 L1+L2", socks0Dial(socks0.ModeEarly)},
 	{"ref L1", refL1},
 	{"ref L1+L2", refL1L2},
 }
