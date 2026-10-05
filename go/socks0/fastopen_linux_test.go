@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -29,19 +30,7 @@ func tfoListen(t *testing.T, handle func(net.Conn)) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() { defer c.Close(); handle(c) }()
-		}
-	}()
-	t.Cleanup(func() { ln.Close(); <-done })
-	return ln.Addr().String()
+	return serve(t, ln, handle)
 }
 
 func tfoSysctl(t *testing.T) int {
@@ -49,10 +38,7 @@ func tfoSysctl(t *testing.T) int {
 	if err != nil {
 		t.Skip(err)
 	}
-	n := 0
-	for _, c := range strings.TrimSpace(string(b)) {
-		n = n*10 + int(c-'0')
-	}
+	n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
 	return n
 }
 

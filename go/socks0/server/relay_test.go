@@ -1,5 +1,7 @@
 package server_test
 
+// Relay and the Conn copy paths: half-close, errors, splice delegation, no cross-talk.
+
 import (
 	"bytes"
 	"context"
@@ -16,24 +18,6 @@ import (
 	"github.com/dengaleev/glitch-gate/go/socks0/server"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
-
-func tcpPair(t testing.TB) (near, far *net.TCPConn) {
-	t.Helper()
-	ln := listenLoopback(t)
-	defer ln.Close()
-	acc := make(chan net.Conn, 1)
-	go func() {
-		c, _ := ln.Accept()
-		acc <- c
-	}()
-	c, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := (<-acc).(*net.TCPConn)
-	t.Cleanup(func() { c.Close(); s.Close() })
-	return c.(*net.TCPConn), s
-}
 
 type relayResult struct {
 	up, down int64
@@ -186,54 +170,6 @@ func TestRelayPanic(t *testing.T) {
 	t.Fatal("no panic")
 }
 
-type spyConn struct {
-	*net.TCPConn
-	mu    sync.Mutex
-	calls []string
-}
-
-func (s *spyConn) log(f string, args ...any) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.calls = append(s.calls, fmt.Sprintf(f, args...))
-}
-
-func (s *spyConn) Write(b []byte) (int, error) {
-	s.log("Write %q", b)
-	return s.TCPConn.Write(b)
-}
-
-func (s *spyConn) WriteTo(w io.Writer) (int64, error) {
-	s.log("WriteTo %T", w)
-	return s.TCPConn.WriteTo(w)
-}
-
-func (s *spyConn) ReadFrom(r io.Reader) (int64, error) {
-	s.log("ReadFrom %T", r)
-	return s.TCPConn.ReadFrom(r)
-}
-
-func (s *spyConn) got() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return strings.Join(s.calls, "; ")
-}
-
-type spyListener struct {
-	net.Listener
-	spies chan *spyConn
-}
-
-func (l spyListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	s := &spyConn{TCPConn: c.(*net.TCPConn)}
-	l.spies <- s
-	return s, nil
-}
-
 // Conn.WriteTo/ReadFrom reach *net.TCPConn as splice recognizes it, after the buffered bytes.
 func TestDelegation(t *testing.T) {
 	for _, viaRelay := range []bool{false, true} {
@@ -270,9 +206,7 @@ func TestDelegation(t *testing.T) {
 				return nil
 			})
 			ln := spyListener{listenLoopback(t), make(chan *spyConn, 1)}
-			go func() { _ = s.Serve(ln) }()
-			defer s.Close()
-			c := dial(t, ln.Addr().String())
+			c := dial(t, serveLn(t, s, ln))
 			_, _ = c.Write(cat(greeting(0), request(wire.CmdConnect, "192.0.2.1:80"), []byte("early")))
 			client := <-ln.spies
 			expect(t, c, []byte{5, 0})
@@ -297,4 +231,39 @@ func TestDelegation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Concurrent tunnels (splice on Linux) never see each other's bytes.
+func TestRelayNoCrossTalk(t *testing.T) {
+	target := echoTCP(t, "127.0.0.1:0")
+	proxy := serve(t, open())
+	const conns, par = 400, 64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, par)
+	for id := range conns {
+		wg.Go(func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			mark := fmt.Appendf(nil, "<conn %04d>", id)
+			early := bytes.Repeat(mark, 1+id%250)
+			rest := bytes.Repeat(mark, 1+(id*37)%9000)
+			c, err := net.Dial("tcp", proxy)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(20 * time.Second))
+			go func() {
+				_, _ = c.Write(cat(greeting(0), request(wire.CmdConnect, target), early))
+				_, _ = c.Write(rest)
+				_ = c.(*net.TCPConn).CloseWrite()
+			}()
+			got, err := io.ReadAll(c)
+			if err != nil || len(got) < 2+10 || !bytes.Equal(got[:2], []byte{5, 0}) || !bytes.Equal(got[12:], cat(early, rest)) {
+				t.Errorf("conn %d: %d bytes, %v", id, len(got), err)
+			}
+		})
+	}
+	wg.Wait()
 }

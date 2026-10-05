@@ -1,6 +1,0 @@
-go test fuzz v1
-byte('Á')
-byte('\x13')
-[]byte("")
-string("[2001:db8::1%\x8e\x81\x8e]:443")
-uint16(89)

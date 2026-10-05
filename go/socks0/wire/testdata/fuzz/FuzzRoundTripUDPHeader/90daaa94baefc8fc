@@ -1,6 +1,0 @@
-go test fuzz v1
-byte('\x00')
-byte('³')
-[]byte("0")
-string("A:0")
-uint16(39)

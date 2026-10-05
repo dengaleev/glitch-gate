@@ -1,15 +1,19 @@
 package socks0_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"net/url"
+	"os"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,42 +36,37 @@ func TestDialModes(t *testing.T) {
 			for _, target := range []string{"198.51.100.7:80", "[2001:db8::7]:443", "example.com:8080"} {
 				t.Run(mode.String()+"/"+a.name+"/"+target, func(t *testing.T) {
 					got := make(chan request, 1)
-					addr := listen(t, proxy{got: got}.serve)
-					d := &socks0.Dialer{ProxyAddr: addr, Config: &socks0.Config{Mode: mode, Auth: a.auth}}
-					c, err := d.DialContext(t.Context(), "tcp", target)
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer c.Close()
-					switch c.(type) {
+					d := &socks0.Dialer{ProxyAddr: listen(t, proxy{got: got}.serve), Config: &socks0.Config{Mode: mode, Auth: a.auth}}
+					c := mustDial(t, d, "tcp", target)
+					// L0 and L1 return the proxy conn; L2 a Conn over it.
+					switch cc := c.(type) {
 					case *net.TCPConn:
 						if mode == socks0.ModeEarly {
 							t.Fatalf("conn is %T", c)
 						}
 					case *socks0.Conn:
-						if mode != socks0.ModeEarly {
-							t.Fatalf("conn is %T", c)
+						if _, ok := cc.NetConn().(*net.TCPConn); mode != socks0.ModeEarly || !ok {
+							t.Fatalf("conn is %T over %T", c, cc.NetConn())
+						}
+						if _, err := cc.SyscallConn(); err != nil {
+							t.Error(err)
 						}
 					default:
 						t.Fatalf("conn is %T", c)
 					}
-					msg := []byte("hello through the proxy")
-					if _, err := c.Write(msg); err != nil {
-						t.Fatal(err)
+					msg := "hello through the proxy"
+					c.Write([]byte(msg))
+					if s := readN(t, c, len(msg)); s != msg {
+						t.Fatalf("echo = %q", s)
 					}
-					buf := make([]byte, len(msg))
-					if _, err := io.ReadFull(c, buf); err != nil || !bytes.Equal(buf, msg) {
-						t.Fatalf("echo = %q, %v", buf, err)
-					}
-					req := <-got
-					want := request{methods: []wire.Method{wire.MethodNoAuth}, target: mustAddr(target)}
+					want := request{methods: []wire.Method{wire.MethodNoAuth}, cmd: wire.CmdConnect, target: mustAddr(target)}
 					if a.auth != nil {
 						want.methods = []wire.Method{wire.MethodUserPass}
 						if up, ok := a.auth.(socks0.UserPass); ok {
 							want.user, want.pass = up.Username, up.Password
 						}
 					}
-					if !reflect.DeepEqual(req, want) {
+					if req := <-got; !reflect.DeepEqual(req, want) {
 						t.Errorf("server got %+v, want %+v", req, want)
 					}
 					if sc, ok := c.(*socks0.Conn); ok && sc.BoundAddr() != defaultBound {
@@ -76,142 +75,6 @@ func TestDialModes(t *testing.T) {
 				})
 			}
 		}
-	}
-}
-
-func TestDialWrites(t *testing.T) {
-	auth := socks0.UserPass{Username: "u", Password: "p"}
-	greet, _ := wire.AppendGreeting(nil, wire.MethodUserPass)
-	up, _ := auth.AppendRequest(nil)
-	req, _ := wire.AppendRequest(nil, wire.CmdConnect, mustAddr("example.com:80"))
-	for _, tt := range []struct {
-		mode socks0.Mode
-		want [][]byte
-	}{
-		{socks0.ModeSequential, [][]byte{greet, up, req, []byte("data")}},
-		{socks0.ModePipelined, [][]byte{slices.Concat(greet, up, req), []byte("data")}},
-		{socks0.ModeEarly, [][]byte{slices.Concat(greet, up, req, []byte("data"))}},
-	} {
-		t.Run(tt.mode.String(), func(t *testing.T) {
-			conns := make(chan *recConn, 1)
-			d := &socks0.Dialer{
-				ProxyAddr: listen(t, proxy{}.serve),
-				ProxyDial: recDial(conns),
-				Config:    &socks0.Config{Mode: tt.mode, Auth: auth},
-			}
-			c, err := d.DialContext(t.Context(), "tcp", "example.com:80")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer c.Close()
-			rc := <-conns
-			if tt.mode != socks0.ModeEarly && c != net.Conn(rc) {
-				t.Fatalf("DialContext returned %T, not the ProxyDial conn", c)
-			}
-			if _, err := c.Write([]byte("data")); err != nil {
-				t.Fatal(err)
-			}
-			if writes, _, _ := rc.snapshot(); !reflect.DeepEqual(writes, tt.want) {
-				t.Errorf("writes = % x\nwant     % x", writes, tt.want)
-			}
-		})
-	}
-}
-
-func TestDialExactRead(t *testing.T) {
-	tail := []byte("tunnel bytes right after the reply")
-	for _, mode := range modes {
-		for _, bound := range []wire.Addr{mustAddr("192.0.2.1:1"), mustAddr("[2001:db8::1]:2"), mustAddr("bound.example:3")} {
-			for _, auth := range []socks0.Authenticator{nil, socks0.UserPass{Username: "u"}} {
-				t.Run(mode.String()+"/"+bound.String(), func(t *testing.T) {
-					conns := make(chan *recConn, 1)
-					p := proxy{bound: bound, tail: tail, coalesce: mode != socks0.ModeSequential, after: func(c net.Conn) { io.Copy(io.Discard, c) }}
-					d := &socks0.Dialer{
-						ProxyAddr: listen(t, p.serve),
-						ProxyDial: recDial(conns),
-						Config:    &socks0.Config{Mode: mode, Auth: auth},
-					}
-					c, err := d.DialContext(t.Context(), "tcp", "example.com:80")
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer c.Close()
-					rc := <-conns
-					if mode == socks0.ModeEarly {
-						if err := c.(*socks0.Conn).HandshakeContext(t.Context()); err != nil {
-							t.Fatal(err)
-						}
-					}
-					replies := 2 + 3 + len(mustBinary(bound))
-					if auth != nil {
-						replies += 2
-					}
-					if _, _, n := rc.snapshot(); n != replies {
-						t.Errorf("handshake read %d bytes, replies are %d", n, replies)
-					}
-					buf := make([]byte, len(tail))
-					if _, err := io.ReadFull(c, buf); err != nil || !bytes.Equal(buf, tail) {
-						t.Errorf("tail = %q, %v", buf, err)
-					}
-				})
-			}
-		}
-	}
-}
-
-func mustBinary(a wire.Addr) []byte {
-	b, err := a.AppendBinary(nil)
-	if err != nil {
-		panic(err)
-	}
-	return b
-}
-
-// net.Pipe: each server message in its own Read, the reply byte by byte.
-func TestDialPipelinedReads(t *testing.T) {
-	var events []string
-	gotMethod := make(chan struct{})
-	trace := &socks0.ClientTrace{
-		GotMethod: func(wire.Method) { events = append(events, "method"); close(gotMethod) },
-		AuthDone:  func(error) { events = append(events, "auth") },
-		GotReply:  func(wire.Reply, wire.Addr) { events = append(events, "reply") },
-	}
-	reply, _ := wire.AppendReply(nil, 0, mustAddr("bound.example:1"))
-	handle := func(s net.Conn) {
-		s.Read(make([]byte, 1024))
-		s.Write([]byte{5, 2})
-		<-gotMethod // before the rest is sent
-		s.Write([]byte{1, 0})
-		for _, b := range reply {
-			s.Write([]byte{b})
-		}
-		s.Write([]byte("tail"))
-	}
-	pd := pipeDial(t, handle)
-	total := 2 + 2 + len(reply)
-	d := &socks0.Dialer{
-		ProxyDial: func(ctx context.Context, n, a string) (net.Conn, error) {
-			c, err := pd(ctx, n, a)
-			return &recConn{Conn: c, limit: total}, err
-		},
-		Config: &socks0.Config{Auth: socks0.UserPass{}, Trace: trace},
-	}
-	c, err := d.DialContext(t.Context(), "tcp", "example.com:80")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	rc := c.(*recConn)
-	_, reads, n := rc.snapshot()
-	if n != total || rc.over || reads[0] != 2+2+5 {
-		t.Errorf("read %d bytes of %d in reads asking %v", n, total, reads)
-	}
-	if !slices.Equal(events, []string{"method", "auth", "reply"}) {
-		t.Errorf("events = %v", events)
-	}
-	buf := make([]byte, 4)
-	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "tail" {
-		t.Errorf("tail = %q, %v", buf, err)
 	}
 }
 
@@ -238,26 +101,25 @@ func TestDialConfigErrors(t *testing.T) {
 		{"not pipelinable", "tcp", "example.com:80", &socks0.Config{Auth: interactive{0x80}}, socks0.ErrNotPipelinable},
 		{"not pipelinable early", "tcp", "example.com:80", &socks0.Config{Mode: socks0.ModeEarly, Auth: interactive{0x80}}, socks0.ErrNotPipelinable},
 		{"pipeliner request", "tcp", "example.com:80", &socks0.Config{Auth: pipeliner{reqErr: errTest}}, errTest},
+		// OfferNoAuth needs ModeSequential, SOCKS5 and Auth, never silently dropped.
+		{"OfferNoAuth pipelined", "tcp", "example.com:80", &socks0.Config{Auth: upAuth, OfferNoAuth: true}, nil},
+		{"OfferNoAuth early", "tcp", "example.com:80", &socks0.Config{Mode: socks0.ModeEarly, Auth: upAuth, OfferNoAuth: true}, nil},
+		{"OfferNoAuth SOCKS4", "tcp", "192.0.2.2:80", &socks0.Config{Mode: socks0.ModeSequential, Version: 4, OfferNoAuth: true}, nil},
+		{"OfferNoAuth SOCKS4 user", "tcp", "192.0.2.2:80", &socks0.Config{Version: 4, Auth: socks0.UserPass{Username: "id"}, OfferNoAuth: true}, nil},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var dialed atomic.Bool
 			d := &socks0.Dialer{
 				ProxyAddr: "192.0.2.1:1080",
-				ProxyDial: func(context.Context, string, string) (net.Conn, error) {
-					dialed.Store(true)
-					return nil, errTest
-				},
-				Config: tt.cfg,
+				ProxyDial: func(context.Context, string, string) (net.Conn, error) { dialed.Store(true); return nil, errTest },
+				Config:    tt.cfg,
 			}
 			c, err := d.DialContext(t.Context(), tt.network, tt.addr)
 			if c != nil || dialed.Load() {
 				t.Fatalf("conn %v, dialed %v", c, dialed.Load())
 			}
-			if he := handshakeErrOf(t, err); he.Stage != socks0.StageConfig {
-				t.Errorf("stage %q", he.Stage)
-			}
-			if k := socks0.KindOf(err); k != socks0.KindConfig {
-				t.Errorf("KindOf = %q", k)
+			if he := handshakeErrOf(t, err); he.Stage != socks0.StageConfig || socks0.KindOf(err) != socks0.KindConfig {
+				t.Errorf("stage %q, kind %q", he.Stage, socks0.KindOf(err))
 			}
 			if tt.is != nil && !errors.Is(err, tt.is) {
 				t.Errorf("err = %v; want it to match %v", err, tt.is)
@@ -265,147 +127,8 @@ func TestDialConfigErrors(t *testing.T) {
 			if strings.Contains(err.Error(), long) {
 				t.Errorf("err holds the credential: %v", err)
 			}
-			t.Log(err)
 		})
 	}
-	var d *socks0.Dialer
-	if _, err := d.Dial("tcp", "example.com:80"); socks0.KindOf(err) != socks0.KindConfig {
-		t.Errorf("nil Dialer: %v", err)
-	}
-}
-
-// interactive is an Authenticator that is not a Pipeliner.
-type interactive struct{ m wire.Method }
-
-func (a interactive) Method() wire.Method { return a.m }
-
-func (a interactive) Authenticate(ctx context.Context, rw io.ReadWriter) error {
-	if _, err := rw.Write([]byte{1, 'x'}); err != nil {
-		return err
-	}
-	var b [1]byte
-	if _, err := io.ReadFull(rw, b[:]); err != nil {
-		return err
-	}
-	if b[0] != 0 {
-		return errors.Join(socks0.ErrAuthFailed, errTest)
-	}
-	return nil
-}
-
-// pipeliner: request "P", reply "ok!" padded to size bytes, or a rejection.
-type pipeliner struct {
-	reqErr error
-	size   int
-}
-
-func (pipeliner) Method() wire.Method { return 0x80 }
-
-func (pipeliner) Authenticate(context.Context, io.ReadWriter) error { return errTest }
-
-func (p pipeliner) AppendRequest(dst []byte) ([]byte, error) {
-	if p.reqErr != nil {
-		return dst, p.reqErr
-	}
-	return append(dst, 'P'), nil
-}
-
-func (p pipeliner) ParseReply(b []byte) (int, error) {
-	n := max(p.size, 3)
-	switch {
-	case len(b) < 3:
-		return 3, wire.ErrIncomplete
-	case string(b[:3]) != "ok!":
-		return 0, errors.Join(socks0.ErrAuthFailed, errTest)
-	case len(b) < n:
-		return n, wire.ErrIncomplete
-	}
-	return n, nil
-}
-
-func TestCustomAuth(t *testing.T) {
-	serve := func(authReply string, n int) func(net.Conn) {
-		return func(c net.Conn) {
-			if _, err := wire.ReadGreeting(c); err != nil {
-				return
-			}
-			c.Write([]byte{5, 0x80})
-			io.ReadFull(c, make([]byte, n))
-			c.Write([]byte(authReply))
-			if _, _, err := wire.ReadRequest(c); err != nil {
-				return
-			}
-			reply, _ := wire.AppendReply(nil, 0, defaultBound)
-			c.Write(append(reply, "tail"...))
-			io.Copy(io.Discard, c)
-		}
-	}
-	for _, tt := range []struct {
-		name  string
-		mode  socks0.Mode
-		auth  socks0.Authenticator
-		srv   func(net.Conn)
-		stage string
-	}{
-		{"pipelined", socks0.ModePipelined, pipeliner{}, serve("ok!", 1), ""},
-		{"long reply", socks0.ModePipelined, pipeliner{size: 1000}, serve("ok!"+strings.Repeat(".", 997), 1), ""},
-		{"too long reply", socks0.ModePipelined, pipeliner{size: 100 << 10}, serve("ok!", 1), socks0.StageAuth},
-		{"pipelined rejected", socks0.ModePipelined, pipeliner{}, serve("no!", 1), socks0.StageAuth},
-		{"early", socks0.ModeEarly, pipeliner{}, serve("ok!", 1), ""},
-		{"sequential", socks0.ModeSequential, interactive{0x80}, serve("\x00", 2), ""},
-		{"sequential rejected", socks0.ModeSequential, interactive{0x80}, serve("\x01", 2), socks0.StageAuth},
-		{"sequential eof", socks0.ModeSequential, interactive{0x80}, scripted([]byte{5, 0x80}, false), socks0.StageAuth},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			var authDone []error
-			cfg := &socks0.Config{Mode: tt.mode, Auth: tt.auth, Trace: &socks0.ClientTrace{
-				AuthDone: func(err error) { authDone = append(authDone, err) },
-			}}
-			d := &socks0.Dialer{ProxyAddr: listen(t, tt.srv), Config: cfg}
-			err := handshakeErr(t.Context(), d, "example.com:80")
-			if len(authDone) != 1 || !errors.Is(err, authDone[0]) {
-				t.Errorf("AuthDone ran with %v; err %v", authDone, err)
-			}
-			if tt.stage == "" {
-				if err != nil {
-					t.Fatal(err)
-				}
-				return
-			}
-			if he := handshakeErrOf(t, err); he.Stage != tt.stage {
-				t.Errorf("stage %q, err %v", he.Stage, err)
-			}
-		})
-	}
-}
-
-func TestDialRejectedAuthStage(t *testing.T) {
-	for _, mode := range modes {
-		d := &socks0.Dialer{
-			ProxyAddr: listen(t, proxy{status: 1}.serve),
-			Config:    &socks0.Config{Mode: mode, Auth: socks0.UserPass{Username: "u", Password: "secret"}},
-		}
-		err := handshakeErr(t.Context(), d, "example.com:80")
-		he := handshakeErrOf(t, err)
-		ae, ok := errors.AsType[*socks0.AuthError](err)
-		if he.Stage != wire.StageUserPassStatus || !ok || ae.Status != 1 || !errors.Is(err, socks0.ErrAuthFailed) || socks0.KindOf(err) != socks0.KindAuth {
-			t.Errorf("%v: %v (stage %q)", mode, err, he.Stage)
-		}
-		if strings.Contains(err.Error(), "secret") {
-			t.Errorf("error holds the password: %v", err)
-		}
-	}
-}
-
-type fakeResolver struct {
-	ips  []netip.Addr
-	err  error
-	nets chan string
-}
-
-func (r fakeResolver) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
-	r.nets <- network + " " + host
-	return r.ips, r.err
 }
 
 func TestDialResolver(t *testing.T) {
@@ -425,11 +148,11 @@ func TestDialResolver(t *testing.T) {
 		{"tcp", nil, "ip", ""},
 	} {
 		got := make(chan request, 1)
-		r := fakeResolver{ips: tt.ips, nets: make(chan string, 1)}
+		r := &resolver{ips: tt.ips}
 		d := &socks0.Dialer{ProxyAddr: listen(t, proxy{got: got}.serve), Resolver: r}
 		c, err := d.DialContext(t.Context(), tt.network, "example.com:80")
-		if l := <-r.nets; l != tt.lookup+" example.com" {
-			t.Errorf("%s: lookup %q", tt.network, l)
+		if !slices.Equal(r.got, []string{tt.lookup + " example.com"}) {
+			t.Errorf("%s: lookups %q", tt.network, r.got)
 		}
 		if tt.want == "" {
 			if he := handshakeErrOf(t, err); he.Stage != socks0.StageResolve || socks0.KindOf(err) != socks0.KindDNS {
@@ -450,17 +173,16 @@ func TestDialResolver(t *testing.T) {
 	}
 
 	// A resolver error; IP literals and the proxy are never looked up.
-	r := fakeResolver{err: errTest, nets: make(chan string, 1)}
+	r := &resolver{err: errTest}
 	d := &socks0.Dialer{ProxyAddr: listen(t, proxy{}.serve), Resolver: r}
 	if _, err := d.DialContext(t.Context(), "tcp", "example.com:80"); !errors.Is(err, errTest) {
 		t.Errorf("err = %v", err)
 	}
-	<-r.nets
-	c, err := d.DialContext(t.Context(), "tcp", "192.0.2.1:80")
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := mustDial(t, d, "tcp", "192.0.2.1:80")
 	c.Close()
+	if len(r.got) != 1 {
+		t.Errorf("lookups %q", r.got)
+	}
 }
 
 func TestDialProxyDialError(t *testing.T) {
@@ -473,58 +195,22 @@ func TestDialProxyDialError(t *testing.T) {
 	if he.Stage != socks0.StageProxyDial || errnoMapped && (!errors.Is(err, eConnRefused) || socks0.KindOf(err) != socks0.KindRefused) {
 		t.Errorf("err = %v (stage %q, kind %q)", err, he.Stage, socks0.KindOf(err))
 	}
-	op := err.(*net.OpError)
-	if op.Net != "tcp" || op.Source.String() != addr || op.Addr.String() != "example.com:80" {
+	if op := err.(*net.OpError); op.Net != "tcp" || op.Source.String() != addr || op.Addr.String() != "example.com:80" {
 		t.Errorf("OpError = %+v", op)
 	}
-
 	d = &socks0.Dialer{ProxyDial: func(context.Context, string, string) (net.Conn, error) { return nil, nil }}
 	if _, err := d.DialContext(t.Context(), "tcp", "example.com:80"); handshakeErrOf(t, err).Stage != socks0.StageProxyDial {
 		t.Errorf("nil conn: %v", err)
 	}
-}
-
-func TestDialClearsDeadlines(t *testing.T) {
-	for _, mode := range modes {
-		conns := make(chan *recConn, 1)
-		rd := recDial(conns)
-		d := &socks0.Dialer{
-			ProxyAddr: listen(t, proxy{}.serve),
-			ProxyDial: func(ctx context.Context, n, a string) (net.Conn, error) {
-				c, err := rd(ctx, n, a)
-				if err == nil {
-					c.SetDeadline(time.Now().Add(time.Hour))
-				}
-				return c, err
-			},
-			Config: &socks0.Config{Mode: mode},
-		}
-		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-		c, err := d.DialContext(ctx, "tcp", "example.com:80")
-		if err != nil {
-			t.Fatal(err)
-		}
-		cancel()
-		rc := <-conns
-		rc.mu.Lock()
-		last := rc.dls[len(rc.dls)-1]
-		rc.mu.Unlock()
-		if !last.IsZero() {
-			t.Errorf("%v: last deadline %v", mode, last)
-		}
-		if _, err := c.Write([]byte("x")); err != nil {
-			t.Errorf("%v: write after cancel: %v", mode, err)
-		}
-		if _, err := io.ReadFull(c, make([]byte, 1)); err != nil {
-			t.Errorf("%v: read after cancel: %v", mode, err)
-		}
-		c.Close()
+	// A conn returned with an error is closed.
+	mc := newMem()
+	d = &socks0.Dialer{ProxyAddr: "proxy:1080", ProxyDial: func(context.Context, string, string) (net.Conn, error) { return mc, errTest }}
+	if _, err := d.DialContext(t.Context(), "tcp", "example.com:80"); !errors.Is(err, errTest) || mc.closes.Load() == 0 {
+		t.Errorf("err %v, conn closed %d times", err, mc.closes.Load())
 	}
 }
 
 func TestDialCancel(t *testing.T) {
-	methodThenSilence := scripted([]byte{5, 0}, true)
-	authThenSilence := scripted([]byte{5, 2, 1, 0}, true)
 	for _, tt := range []struct {
 		name  string
 		srv   func(net.Conn)
@@ -533,15 +219,14 @@ func TestDialCancel(t *testing.T) {
 		stage string
 	}{
 		{"silent", scripted(nil, true), nil, modes[:2], wire.StageMethodSelection},
-		{"method only", methodThenSilence, nil, modes[:2], wire.StageReply},
-		{"auth only", authThenSilence, socks0.UserPass{}, modes[1:2], wire.StageReply},
+		{"method only", scripted([]byte{5, 0}, true), nil, modes[:2], wire.StageReply},
+		{"auth only", scripted([]byte{5, 2, 1, 0}, true), socks0.UserPass{}, modes[1:2], wire.StageReply},
 		{"auth pending", scripted([]byte{5, 2}, true), socks0.UserPass{}, modes[:2], wire.StageUserPassStatus},
 		{"auth pending custom", scripted([]byte{5, 0x80}, true), interactive{0x80}, modes[:1], socks0.StageAuth},
 	} {
 		for _, mode := range tt.modes {
 			t.Run(tt.name+"/"+mode.String(), func(t *testing.T) {
 				d := &socks0.Dialer{ProxyAddr: listen(t, tt.srv), Config: &socks0.Config{Mode: mode, Auth: tt.auth}}
-
 				ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 				defer cancel()
 				_, err := d.DialContext(ctx, "tcp", "example.com:80")
@@ -549,7 +234,6 @@ func TestDialCancel(t *testing.T) {
 				if he.Stage != tt.stage || !errors.Is(err, context.DeadlineExceeded) || !err.(net.Error).Timeout() || socks0.KindOf(err) != socks0.KindTimeout {
 					t.Errorf("deadline: %v (stage %q)", err, he.Stage)
 				}
-
 				ctx, cancel = context.WithCancel(t.Context())
 				time.AfterFunc(20*time.Millisecond, cancel)
 				_, err = d.DialContext(ctx, "tcp", "example.com:80")
@@ -560,19 +244,45 @@ func TestDialCancel(t *testing.T) {
 			})
 		}
 	}
-
-	// Already canceled: fails before the dial completes.
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	d := &socks0.Dialer{ProxyAddr: listen(t, proxy{}.serve)}
-	if _, err := d.DialContext(ctx, "tcp", "example.com:80"); !errors.Is(err, context.Canceled) {
-		t.Errorf("canceled ctx: %v", err)
-	}
-	// A ProxyDial ignoring ctx: cancellation still wins.
-	d.ProxyDial = func(context.Context, string, string) (net.Conn, error) { return nil, errTest }
-	if _, err := d.DialContext(ctx, "tcp", "example.com:80"); !errors.Is(err, context.Canceled) {
-		t.Errorf("canceled ctx, custom ProxyDial: %v", err)
-	}
+	t.Run("canceled before", func(t *testing.T) {
+		// It fails and closes the conn, also when ProxyDial ignores the ctx (a pool, a mux).
+		for _, mode := range modes {
+			for range 300 {
+				mc := newMem(goodReplies)
+				d := &socks0.Dialer{ProxyAddr: "proxy:1080", Config: &socks0.Config{Mode: mode}, ProxyDial: memDial(mc)}
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				c, err := d.DialContext(ctx, "tcp", "example.com:80")
+				if err == nil {
+					c.Close()
+					t.Fatalf("%v: DialContext(canceled) succeeded", mode)
+				}
+				if !errors.Is(err, context.Canceled) || mc.closes.Load() != 1 {
+					t.Fatalf("%v: %v, conn closed %d times", mode, err, mc.closes.Load())
+				}
+			}
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		d := &socks0.Dialer{ProxyAddr: listen(t, proxy{}.serve)}
+		if _, err := d.DialContext(ctx, "tcp", "example.com:80"); !errors.Is(err, context.Canceled) {
+			t.Errorf("canceled ctx: %v", err)
+		}
+		d.ProxyDial = func(context.Context, string, string) (net.Conn, error) { return nil, errTest }
+		if _, err := d.DialContext(ctx, "tcp", "example.com:80"); !errors.Is(err, context.Canceled) {
+			t.Errorf("canceled ctx, failing ProxyDial: %v", err)
+		}
+	})
+	t.Run("cause", func(t *testing.T) {
+		// ctx.Err() is wrapped, not context.Cause.
+		cause := errors.New("my cause")
+		d := &socks0.Dialer{ProxyAddr: "p:1", ProxyDial: memDial(newMem([]byte{5, 0}))}
+		ctx, cancel := context.WithCancelCause(context.Background())
+		time.AfterFunc(10*time.Millisecond, func() { cancel(cause) })
+		if _, err := d.DialContext(ctx, "tcp", "x:1"); !errors.Is(err, context.Canceled) || errors.Is(err, cause) {
+			t.Errorf("Dialer: %v", err)
+		}
+	})
 }
 
 // A dial whose handshake succeeded as ctx was canceled fails, closed.
@@ -593,16 +303,318 @@ func TestDialCancelRace(t *testing.T) {
 	}
 }
 
+// Chaining: the second proxy is reached through the first; each hop runs the ctx trace.
 func TestDialChain(t *testing.T) {
 	got := make(chan request, 2)
 	first := &socks0.Dialer{ProxyAddr: listen(t, proxy{got: got}.serve)}
 	second := &socks0.Dialer{ProxyAddr: "second.example:1080", ProxyDial: first.DialContext}
+	var (
+		mu    sync.Mutex
+		addrs []string
+	)
+	ctx := socks0.WithClientTrace(t.Context(), &socks0.ClientTrace{ConnectStart: func(_, a string) {
+		mu.Lock()
+		addrs = append(addrs, a)
+		mu.Unlock()
+	}})
 	// The first proxy echoes: the greeting reads back as VER 5, method 1.
-	_, err := second.DialContext(t.Context(), "tcp", "example.com:80")
+	_, err := second.DialContext(ctx, "tcp", "example.com:80")
 	if req := <-got; req.target.String() != "second.example:1080" {
 		t.Errorf("first proxy got %v", req.target)
 	}
 	if me, ok := errors.AsType[*socks0.MethodError](err); !ok || me.Selected != 1 {
 		t.Errorf("err = %v", err)
+	}
+	if mu.Lock(); len(addrs) != 2 || addrs[0] != "second.example:1080" {
+		t.Errorf("ConnectStart addrs %q", addrs)
+	}
+	mu.Unlock()
+}
+
+func TestDialNoGoroutineLeak(t *testing.T) {
+	addr := listen(t, scripted([]byte{5, 0}, true))
+	base := runtime.NumGoroutine()
+	for i := range 60 {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(i%5)*time.Millisecond)
+		d := &socks0.Dialer{ProxyAddr: addr, Config: &socks0.Config{Mode: modes[i%3], ReplyTimeout: time.Millisecond}}
+		if c, err := d.DialContext(ctx, "tcp", "example.com:80"); err == nil {
+			if sc, ok := c.(*socks0.Conn); ok {
+				sc.HandshakeContext(ctx)
+			}
+			c.Close()
+		}
+		cancel()
+	}
+	waitGoroutines(t, base+2) // server handlers may linger until their conns close
+}
+
+func openFDs(t *testing.T) int {
+	for _, dir := range []string{"/proc/self/fd", "/dev/fd"} {
+		if es, err := os.ReadDir(dir); err == nil {
+			return len(es)
+		}
+	}
+	t.Skip("cannot count fds")
+	return 0
+}
+
+// Failed UDP ASSOCIATE, BIND and RESOLVE leave no fd or goroutine behind.
+func TestDialErrorsDoNotLeak(t *testing.T) {
+	errDial := errors.New("relay dial refused by test")
+	good := listenProxy(t)
+	rep7 := listen(t, udpProxy{rep: wire.ReplyCommandNotSupported}.serve)
+	port0 := listen(t, udpProxy{bnd: func(netip.AddrPort) wire.Addr { return mustAddr("127.0.0.1:0") }}.serve)
+	unspec := listen(t, udpProxy{bnd: func(ap netip.AddrPort) wire.Addr { return mustAddr(fmt.Sprint("0.0.0.0:", ap.Port())) }}.serve)
+	hang := listen(t, func(c net.Conn) { io.Copy(io.Discard, c) })
+	bindEOF := listen(t, bind5(func(c net.Conn) { c.Write(reply(0, "127.0.0.1:5555")) }))
+	tor := listen(t, answer([]byte{5, 4, 0, 0, 0, 0, 0, 0, 0, 0}, nil, false))
+	for _, tc := range []struct {
+		name  string
+		d     *socks0.Dialer
+		op    string // "dial", "listen packet", "bind" or "resolve"
+		short bool   // under a 20 ms ctx
+	}{
+		{"REP 07", &socks0.Dialer{ProxyAddr: rep7}, "listen packet", false},
+		{"BND port 0", &socks0.Dialer{ProxyAddr: port0}, "listen packet", false},
+		{"RelayDial error", &socks0.Dialer{ProxyAddr: good, RelayDial: func(context.Context, string, string) (net.Conn, error) { return nil, errDial }}, "dial", false},
+		{"RelayDial conn and error", &socks0.Dialer{ProxyAddr: good, RelayDial: func(ctx context.Context, n, a string) (net.Conn, error) {
+			c, _ := new(net.Dialer).DialContext(ctx, n, a)
+			return c, errDial
+		}}, "dial", false},
+		{"RelayListen conn and error", &socks0.Dialer{ProxyAddr: good, RelayListen: func(ctx context.Context, n, a string) (net.PacketConn, error) {
+			c, _ := net.ListenPacket(n, a)
+			return c, errDial
+		}}, "listen packet", false},
+		{"RelayDial nil, nil", &socks0.Dialer{ProxyAddr: good, RelayDial: func(context.Context, string, string) (net.Conn, error) { return nil, nil }}, "listen packet", false},
+		{"substitution DNS failure", &socks0.Dialer{ProxyAddr: "no-such-host.invalid:1", ProxyDial: func(ctx context.Context, n, _ string) (net.Conn, error) {
+			return new(net.Dialer).DialContext(ctx, n, unspec)
+		}}, "listen packet", false},
+		{"ctx timeout in handshake", &socks0.Dialer{ProxyAddr: hang}, "listen packet", true},
+		{"BIND EOF before reply 2", &socks0.Dialer{ProxyAddr: bindEOF}, "bind", false},
+		{"BIND ctx timeout", &socks0.Dialer{ProxyAddr: hang}, "bind", true},
+		{"RESOLVE REP 04", &socks0.Dialer{ProxyAddr: tor}, "resolve", false},
+		{"RESOLVE timeout", &socks0.Dialer{ProxyAddr: hang}, "resolve", true},
+	} {
+		f := func(ctx context.Context) (err error) {
+			if tc.short {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, 20*time.Millisecond)
+				defer cancel()
+			}
+			switch tc.op {
+			case "dial":
+				_, err = tc.d.DialContext(ctx, "udp", "192.0.2.1:9")
+			case "listen packet":
+				_, err = tc.d.ListenPacket(ctx, "udp", "")
+			case "bind":
+				var ln net.Listener
+				if ln, err = tc.d.Listen(ctx, "tcp", "192.0.2.1:1"); err == nil {
+					_, err = ln.Accept()
+				}
+			case "resolve":
+				_, err = tc.d.LookupHost(ctx, "nx.example")
+			}
+			return err
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			f(t.Context()) // warm up (resolver, listeners)
+			time.Sleep(20 * time.Millisecond)
+			runtime.GC()
+			fds, gs := openFDs(t), runtime.NumGoroutine()
+			for range 10 {
+				if err := f(t.Context()); err == nil {
+					t.Fatal("no error")
+				}
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				runtime.GC()
+				nf, ng := openFDs(t), runtime.NumGoroutine()
+				if nf <= fds && ng <= gs+1 {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("fds %d → %d, goroutines %d → %d", fds, nf, gs, ng)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}
+
+// Config.HandshakeTimeout bounds the proxy dial and the handshake; 30 s by default.
+func TestHandshakeTimeout(t *testing.T) {
+	t.Run("ProxyDial ctx", func(t *testing.T) {
+		errStop := errors.New("stop")
+		dialOp := func(d *socks0.Dialer, ctx context.Context) error {
+			_, err := d.DialContext(ctx, "tcp", "x.test:80")
+			return err
+		}
+		for _, tc := range []struct {
+			name string
+			hst  time.Duration
+			ctx  time.Duration // ctx deadline from now; zero: none
+			want time.Duration // ProxyDial's ctx deadline from now; zero: none
+			op   func(d *socks0.Dialer, ctx context.Context) error
+		}{
+			{name: "Dial", want: 30 * time.Second, op: dialOp},
+			{name: "Dial ctx deadline kept", ctx: time.Hour, want: time.Hour, op: dialOp},
+			{name: "Dial explicit", hst: 5 * time.Second, want: 5 * time.Second, op: dialOp},
+			{name: "Dial explicit, earlier ctx", hst: 5 * time.Second, ctx: 2 * time.Second, want: 2 * time.Second, op: dialOp},
+			{name: "Dial none", hst: -1, op: dialOp},
+			{name: "Listen", want: 30 * time.Second, op: func(d *socks0.Dialer, ctx context.Context) error { _, err := d.Listen(ctx, "tcp", ""); return err }},
+			{name: "ListenUDP", want: 30 * time.Second, op: func(d *socks0.Dialer, ctx context.Context) error { _, err := d.ListenUDP(ctx, "udp", ""); return err }},
+			{name: "LookupNetIP", want: 30 * time.Second, op: func(d *socks0.Dialer, ctx context.Context) error {
+				_, err := d.LookupNetIP(ctx, "ip", "x.test")
+				return err
+			}},
+		} {
+			for _, mode := range modes {
+				var dl time.Time
+				var has bool
+				d := &socks0.Dialer{ProxyAddr: "proxy.test:1080", Config: &socks0.Config{Mode: mode, HandshakeTimeout: tc.hst},
+					ProxyDial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+						dl, has = ctx.Deadline()
+						return nil, errStop
+					}}
+				ctx := context.Background()
+				if tc.ctx > 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tc.ctx)
+					defer cancel()
+				}
+				if err := tc.op(d, ctx); !errors.Is(err, errStop) {
+					t.Fatalf("%s %v: %v", tc.name, mode, err)
+				}
+				if left := time.Until(dl); has != (tc.want > 0) || has && (left > tc.want || left < tc.want-5*time.Second) {
+					t.Errorf("%s %v: ProxyDial ctx deadline in %v (set %v), want %v", tc.name, mode, left, has, tc.want)
+				}
+			}
+		}
+	})
+	t.Run("tarpit", func(t *testing.T) {
+		tarpit := listen(t, func(c net.Conn) { io.Copy(io.Discard, c) })
+		within := func(name string, f func() error) {
+			t.Helper()
+			start := time.Now()
+			done := make(chan error, 1)
+			go func() { done <- f() }()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.DeadlineExceeded) && socks0.KindOf(err) != socks0.KindTimeout {
+					t.Errorf("%s: %v (kind %s), want a timeout", name, err, socks0.KindOf(err))
+				}
+				if el := time.Since(start); el > 3*time.Second {
+					t.Errorf("%s: took %v", name, el)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s: still blocked after 10 s", name)
+			}
+		}
+		for _, mode := range modes {
+			cfg := &socks0.Config{Mode: mode, HandshakeTimeout: 200 * time.Millisecond}
+			d := &socks0.Dialer{ProxyAddr: tarpit, Config: cfg}
+			within(fmt.Sprint("Dialer ", mode), func() error {
+				c, err := d.Dial("tcp", "example.com:80")
+				if err == nil { // ModeEarly: the reply wait, after the first Write
+					defer c.Close()
+					if _, err = c.Write([]byte("x")); err == nil {
+						_, err = c.Read(make([]byte, 1))
+					}
+				}
+				return err
+			})
+			for _, op := range []string{"Read", "Write", "HandshakeContext"} {
+				if op == "Read" && mode == socks0.ModeEarly {
+					continue // a Read before the first Write waits for it, by design
+				}
+				within(fmt.Sprint("Client ", mode, " ", op), func() error {
+					nc, err := net.Dial("tcp", tarpit)
+					if err != nil {
+						return err
+					}
+					c := socks0.Client(nc, "example.com:80", cfg)
+					defer c.Close()
+					switch op {
+					case "Read":
+						_, err = c.Read(make([]byte, 1))
+					case "Write":
+						if _, err = c.Write([]byte("x")); err == nil {
+							_, err = c.Read(make([]byte, 1)) // ModeEarly writes without waiting
+						}
+					default:
+						err = c.HandshakeContext(context.Background())
+					}
+					return err
+				})
+			}
+		}
+		// ModeEarly: ReplyTimeout wins over HandshakeTimeout.
+		d := &socks0.Dialer{ProxyAddr: tarpit, Config: &socks0.Config{Mode: socks0.ModeEarly, ReplyTimeout: 200 * time.Millisecond, HandshakeTimeout: time.Hour}}
+		within("ReplyTimeout wins", func() error {
+			c, err := d.Dial("tcp", "example.com:80")
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			return c.(*socks0.Conn).HandshakeContext(context.Background())
+		})
+	})
+}
+
+// Nil, zero and huge inputs fail without panicking; a nil Dialer's methods fail as config errors.
+func TestNoPanicOnBadInput(t *testing.T) {
+	huge := strings.Repeat("a", 1<<20)
+	bg := context.Background()
+	for name, f := range map[string]func(){
+		"zero Dialer": func() { (&socks0.Dialer{}).DialContext(bg, "tcp", "x:1") },
+		//lint:ignore SA1012 a nil ctx must not panic
+		"nil ctx":     func() { (&socks0.Dialer{ProxyAddr: "127.0.0.1:1"}).DialContext(nil, "tcp", "x:1") }, //nolint:staticcheck
+		"empty args":  func() { (&socks0.Dialer{}).Dial("", "") },
+		"huge target": func() { (&socks0.Dialer{}).Dial("tcp", huge+":80") },
+		"huge proxy":  func() { (&socks0.Dialer{ProxyAddr: huge}).Dial("tcp", "x:80") },
+		"256 name": func() {
+			socks0.Client(newMem(), strings.Repeat("n", 256)+":1", nil).HandshakeContext(bg)
+		},
+		"zone target":      func() { socks0.Client(newMem(), "[fe80::1%en0]:1", nil).HandshakeContext(bg) },
+		"huge mode":        func() { socks0.Client(newMem(), "x:1", &socks0.Config{Mode: 255}).HandshakeContext(bg) },
+		"neg ReplyTimeout": func() { socks0.Client(newMem(goodReplies), "x:1", early(replyTimeout(-1))).HandshakeContext(bg) },
+		"zero errors": func() {
+			_ = (&socks0.HandshakeError{}).Error()
+			(&socks0.HandshakeError{}).Timeout()
+			_ = (&socks0.ReplyError{}).Error()
+			errors.Is(&socks0.ReplyError{}, nil)
+			_ = (&socks0.MethodError{}).Error()
+			_ = (&socks0.AuthError{}).Error()
+		},
+		"zero ProxyURL":      func() { socks0.ParseProxyURL(&url.URL{Scheme: "socks5"}) },
+		"WithClientTrace":    func() { socks0.WithClientTrace(bg, &socks0.ClientTrace{}) },
+		"Mode String":        func() { _ = socks0.Mode(200).String() },
+		"UserPass nil rw":    func() { socks0.UserPass{Username: huge}.Authenticate(bg, nil) },
+		"UserPass ParseNil":  func() { socks0.UserPass{}.ParseReply(nil) },
+		"Close twice nilcfg": func() { c := socks0.Client(newMem(), "x:1", nil); c.Close(); c.Close() },
+	} {
+		noPanic(t, name, f)
+	}
+	var d *socks0.Dialer
+	ctx := t.Context()
+	for name, f := range map[string]func() error{
+		"Dial":            func() error { _, err := d.Dial("tcp", "example.com:80"); return err },
+		"DialContext udp": func() error { _, err := d.DialContext(ctx, "udp", "192.0.2.1:53"); return err },
+		"DialContext udp4": func() error {
+			_, err := d.DialContext(ctx, "udp4", "192.0.2.1:53")
+			return err
+		},
+		"ListenPacket": func() error { _, err := d.ListenPacket(ctx, "udp", ""); return err },
+		"Listen":       func() error { _, err := d.Listen(ctx, "tcp", "192.0.2.1:21"); return err },
+		"LookupNetIP":  func() error { _, err := d.LookupNetIP(ctx, "ip", "example.com"); return err },
+		"LookupHost":   func() error { _, err := d.LookupHost(ctx, "example.com"); return err },
+		"LookupAddr":   func() error { _, err := d.LookupAddr(ctx, "192.0.2.1"); return err },
+	} {
+		noPanic(t, "nil Dialer "+name, func() {
+			if err := f(); socks0.KindOf(err) != socks0.KindConfig {
+				t.Errorf("nil Dialer %s: %v, want a config error", name, err)
+			}
+		})
 	}
 }

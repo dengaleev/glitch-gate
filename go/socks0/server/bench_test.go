@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,7 +122,7 @@ func BenchmarkHandshake(b *testing.B) {
 
 // One pipelined CONNECT + echo over loopback, harness included, as the bench's allocs/op counts it.
 func BenchmarkConnect(b *testing.B) {
-	r, err := startRig(newServer("", ""), "127.0.0.1")
+	r, err := startRig(newServer("", ""), "127.0.0.1", nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -158,7 +159,8 @@ func BenchmarkRelayThroughput(b *testing.B) {
 	c.Close()
 }
 
-// Zero allocations per datagram once the target is known.
+// Zero allocations per datagram once the target is known, and no amplification: the relay's
+// answer is as long as the client's datagram.
 func TestUDPZeroAllocs(t *testing.T) {
 	e := udpSock(t)
 	go func() {
@@ -184,7 +186,20 @@ func TestUDPZeroAllocs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	rt()
+	var in, out int
+	for i := range 64 {
+		d := dgram(apOf(e.LocalAddr()), strings.Repeat("x", 1+i))
+		_, _ = c.WriteToUDPAddrPort(d, ra)
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, _, err := c.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		in, out = in+len(d), out+n
+	}
+	if out != in {
+		t.Errorf("client->relay %d B, relay->client %d B", in, out)
+	}
 	if n := testing.AllocsPerRun(200, rt); n > 0.5 {
 		t.Errorf("%.2f allocs per datagram round trip", n)
 	}
@@ -229,24 +244,15 @@ func BenchmarkConnectVsReference(b *testing.B) {
 	for _, timeout := range []time.Duration{30 * time.Second, -1} {
 		for _, name := range []string{"server", "reference"} {
 			b.Run(fmt.Sprintf("%s/timeout=%v", name, timeout), func(b *testing.B) {
-				s := open()
-				s.Handler = &server.ConnectHandler{Filter: server.AllowAll, DialTimeout: timeout}
-				defer s.Close()
-				serve := func(ln net.Listener) { _ = s.Serve(ln) }
+				s := withHandler(&server.ConnectHandler{Filter: server.AllowAll, DialTimeout: timeout})
+				var serve func(net.Listener)
 				if name == "reference" {
 					serve = func(ln net.Listener) { refServe(ln, max(timeout, 0)) }
 				}
-				r := &rig{srv: s}
-				lns, port, err := echoListeners("127.0.0.1")
+				r, err := startRig(s, "127.0.0.1", serve)
 				if err != nil {
 					b.Fatal(err)
 				}
-				for _, ln := range lns {
-					r.wg.Go(func() { r.echo(ln) })
-				}
-				pln := listenLoopback(b)
-				r.wg.Go(func() { serve(pln) })
-				r.proxy, r.target, r.listeners = pln.Addr().String(), net.JoinHostPort("127.0.0.1", port), append(lns, pln)
 				defer r.close()
 				k := kase{host: "127.0.0.1", split: oneWrite}
 				b.ReportAllocs()

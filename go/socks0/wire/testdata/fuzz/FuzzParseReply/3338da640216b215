@@ -1,3 +1,0 @@
-go test fuzz v1
-[]byte("\x0500\x03\x01000")
-byte('ð')

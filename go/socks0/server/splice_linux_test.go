@@ -35,9 +35,9 @@ func TestSpliceUsed(t *testing.T) {
 	echo := echoTCP(t, "127.0.0.1:0")
 	before := pipeFDs(t)
 	c := dial(t, serve(t, open()))
-	m, _ := newMessage("", "", echo, payload()[:1<<20])
+	m := newMessage("", "", echo, payload()[:1<<20])
 	go func() { _, _ = c.Write(m.wire); _ = c.CloseWrite() }()
-	if err := s5ReadReplies(c, ""); err != nil {
+	if err := handshakeReplies(c, ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := io.ReadAll(c)
@@ -49,7 +49,7 @@ func TestSpliceUsed(t *testing.T) {
 	}
 }
 
-// S8
+// Relayer.UserTimeout sets TCP_USER_TIMEOUT on both sides: 2 min by default, none if negative.
 func TestUserTimeout(t *testing.T) {
 	for _, tt := range []struct {
 		set  time.Duration

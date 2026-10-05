@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/dengaleev/glitch-gate/go/socks0"
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
@@ -55,6 +56,11 @@ func TestErrorIs(t *testing.T) {
 		{&socks0.MethodError{Offered: 0, Selected: 2}, socks0.ErrMethodNotOffered, true},
 		{&socks0.MethodError{Offered: 0, Selected: 2}, socks0.ErrNoAcceptableMethods, false},
 		{&socks0.MethodError{Offered: 2, Selected: 2}, socks0.ErrMethodNotOffered, false},
+		// With OfferNoAuth, the server may select either offered method.
+		{&socks0.MethodError{Offered: 2, Selected: 0, OfferedNoAuth: true}, socks0.ErrMethodNotOffered, false},
+		{&socks0.MethodError{Offered: 2, Selected: 0}, socks0.ErrMethodNotOffered, true},
+		{&socks0.MethodError{Offered: 2, Selected: 1, OfferedNoAuth: true}, socks0.ErrMethodNotOffered, true},
+		{&socks0.MethodError{Offered: 2, Selected: 0xFF, OfferedNoAuth: true}, socks0.ErrNoAcceptableMethods, true},
 		{&socks0.MethodError{}, socks0.ErrAuthFailed, false},
 		{&socks0.AuthError{}, socks0.ErrAuthFailed, true},
 		{&socks0.AuthError{}, socks0.ErrNoAcceptableMethods, false},
@@ -88,6 +94,15 @@ func TestHandshakeErrorUnwrap(t *testing.T) {
 	}
 }
 
+// A Client's handshake error names the proxy by the conn's RemoteAddr and the target as asked.
+func TestHandshakeErrorOpError(t *testing.T) {
+	err := socks0.Client(newMem([]byte{5, 0xFF}), "example.com:80", nil).HandshakeContext(context.Background())
+	op, ok := err.(*net.OpError)
+	if !ok || op.Net != "tcp" || op.Source == nil || op.Source.String() != "proxy" || op.Addr == nil || op.Addr.String() != "example.com:80" {
+		t.Errorf("%#v", err)
+	}
+}
+
 type timeoutErr struct{ timeout bool }
 
 func (e timeoutErr) Error() string { return fmt.Sprint("timeout ", e.timeout) }
@@ -109,6 +124,7 @@ func hs(stage string, err error) error {
 }
 
 func TestKindOf(t *testing.T) {
+	dial := func(err error) error { return hs(socks0.StageProxyDial, &net.OpError{Op: "dial", Err: err}) }
 	tests := []kindTest{
 		{nil, ""},
 		{hs(socks0.StageConfig, errTest), socks0.KindConfig},
@@ -123,6 +139,9 @@ func TestKindOf(t *testing.T) {
 		{hs(wire.StageReply, context.Canceled), socks0.KindCanceled},
 		{hs(wire.StageReply, net.ErrClosed), socks0.KindClosed},
 		{hs(socks0.StageResolve, &net.DNSError{Err: "no such host", IsNotFound: true}), socks0.KindDNS},
+		{dial(&net.DNSError{Err: "no such host", Name: "proxy.example", IsNotFound: true}), socks0.KindDNS},
+		{dial(errors.New("weird")), socks0.KindNetwork},
+		{hs(socks0.StageProxyDial, errTest), socks0.KindOther},
 		{hs(wire.StageReply, context.DeadlineExceeded), socks0.KindTimeout},
 		{hs(wire.StageReply, os.ErrDeadlineExceeded), socks0.KindTimeout},
 		{errors.Join(errTest, timeoutErr{true}), socks0.KindTimeout},
@@ -131,16 +150,64 @@ func TestKindOf(t *testing.T) {
 		{io.ErrUnexpectedEOF, socks0.KindEOF},
 		{hs(wire.StageReply, netErr{}), socks0.KindNetwork},
 		{errTest, socks0.KindOther},
-		// Amendments for the server (DESIGN.md §4).
+		// Server-side errors (DESIGN.md §4).
 		{hs(wire.StageReply, rep(wire.ReplyNotAllowed)), socks0.KindReply},
 		{fmt.Errorf("dial: %w", socks0.ErrNotAllowed), socks0.KindDenied},
 		{errors.Join(socks0.ErrNotAllowed, context.Canceled), socks0.KindDenied},
 		{fmt.Errorf("greeting: %w", socks0.ErrNoAcceptableMethods), socks0.KindMethod},
 	}
-	tests = append(tests, errnoKindTests()...)
-	for _, tt := range tests {
+	for _, tt := range append(tests, errnoKindTests()...) {
 		if got := socks0.KindOf(tt.err); got != tt.want {
 			t.Errorf("KindOf(%v) = %q, want %q", tt.err, got, tt.want)
 		}
+	}
+	for name, err := range map[string]error{
+		"*HandshakeError(nil)":                (*socks0.HandshakeError)(nil),
+		"*ReplyError(nil)":                    (*socks0.ReplyError)(nil),
+		"*MethodError(nil)":                   (*socks0.MethodError)(nil),
+		"*AuthError(nil)":                     (*socks0.AuthError)(nil),
+		"*ProtocolError(nil)":                 (*socks0.ProtocolError)(nil),
+		"HandshakeError{Err: nil}":            &socks0.HandshakeError{Stage: "x"},
+		"HandshakeError{Err: (*ReplyError)0}": &socks0.HandshakeError{Stage: "x", Err: (*socks0.ReplyError)(nil)},
+	} {
+		noPanic(t, "KindOf("+name+")", func() { socks0.KindOf(err) })
+	}
+}
+
+func TestIsProxyError(t *testing.T) {
+	he := &socks0.HandshakeError{Stage: socks0.StageProxyDial, Err: errors.New("x")}
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{io.EOF, false},
+		{net.ErrClosed, false},
+		{&net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}, false},
+		{context.Canceled, false},
+		{&net.OpError{Op: "socks connect", Net: "tcp", Err: he}, true},
+		{fmt.Errorf("get: %w", &net.OpError{Op: "socks connect", Err: he}), true},
+		{&net.OpError{Op: "read", Net: "udp", Err: fmt.Errorf("%w: %w", socks0.ErrAssociationClosed, io.EOF)}, true},
+		{&socks0.ReplyError{Reply: wire.ReplyHostUnreachable}, true},
+		{&socks0.MethodError{Selected: 0xFF}, true},
+		{&socks0.AuthError{Status: 1}, true},
+		{&socks0.ProtocolError{Stage: wire.StageReply}, true},
+		{(*socks0.ReplyError)(nil), true},
+	} {
+		if got := socks0.IsProxyError(tc.err); got != tc.want {
+			t.Errorf("IsProxyError(%v) = %v", tc.err, got)
+		}
+	}
+
+	// From a real dial: refused proxy, REP 05; and plain I/O afterwards.
+	d := &socks0.Dialer{ProxyAddr: listen(t, proxy{rep: wire.ReplyConnectionRefused}.serve)}
+	if _, err := d.DialContext(t.Context(), "tcp", "192.0.2.2:80"); !socks0.IsProxyError(err) {
+		t.Errorf("REP 05: %v", err)
+	}
+	d = &socks0.Dialer{ProxyAddr: listen(t, proxy{after: func(c net.Conn) {}}.serve)}
+	c := mustDial(t, d, "tcp", "192.0.2.2:80")
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil || socks0.IsProxyError(err) {
+		t.Errorf("target EOF: %v", err)
 	}
 }

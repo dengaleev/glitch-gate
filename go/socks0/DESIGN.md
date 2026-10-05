@@ -263,7 +263,7 @@ released buffers are zeroed.
 | Hostile proxy (client) | BND scope check, `SO_BROADCAST` cleared on the relay, exact reads, `HandshakeTimeout` against tarpits; redaction; L1/L2 on untrusted networks → TLS or L0 |
 | Info leaks | CONNECT BND reveals the egress address (RFC); hooks get raw names, so escape control characters |
 
-Accepted security-review fixes, each pinned by a `TestSec_*` regression test:
+Security fixes, each pinned by a regression test:
 - **Client:** credential redaction and auth-buffer zeroing; the hostile-BND scope check with `SO_BROADCAST`
   cleared; opt-in `AssociateLocalPort`; the 30 s `HandshakeTimeout` default against tarpits.
 - **Server:** SOCKS4 admitted only with the built-in `NoAuth`; `SelfAddrs` (1:1 NAT loops); Azure WireServer in
@@ -295,15 +295,14 @@ Accepted security-review fixes, each pinned by a `TestSec_*` regression test:
   KiB} × 7 splits. It adds early data + `CloseWrite`, a split u/p, a slow dial with 1 MiB early data,
   target-first protocols, and I7.
 - **Interop:** `../socks5-zero-rtt-bench/interop_test.go`: 3 modes × 9 servers × auth × ATYP × size. L2 on sing
-  and GOST is expected to fail. Every bench client × `socks0/server`: 132 cases. `server/interop_test.go`: the
+  and GOST is expected to fail. Every bench client × `socks0/server`: 132 cases. `TestInterop*` in `server/`: the
   socks0 client against the server, TLS included.
 - **Splice, security, coverage:** `TestDelegation` (spy conns), `TestSpliceUsed` (`/proc/self/fd`); security
-  regressions are `TestSec_*` in `sec_client*_test.go` and `server/sec_*_test.go`. Coverage: wire 100%, client
-  ~97%, server ~96%.
+  regressions sit with the component they test. Coverage: wire 100%, client ~98%, server ~97%.
 - **Linux-only tests** (run from `go/socks0`; the Docker commands are in the file headers):
-  - `SEC_NETNS=1 go test -race -run '^TestSec' . ./server` needs `--cap-add NET_ADMIN`. It covers public
-    addresses, a 1:1 NAT hairpin and a public subnet (`server/sec_netns_linux_test.go`). `SEC_PRIVATE_IP`
+  - `SEC_NETNS=1 go test -race -run 'Netns$' . ./server` needs `--cap-add NET_ADMIN`. It covers public
+    addresses, a 1:1 NAT hairpin and a public subnet (`udp_netns_linux_test.go`, `server/netns_linux_test.go`). `SEC_PRIVATE_IP`
     selects the two-container NAT variant.
-  - `SOCKS0_NETEM_RTT=100ms go test -run TestV2TFORoundTrips` needs `tcp_fastopen=3` and netem on lo. With a
+  - `SOCKS0_NETEM_RTT=100ms go test -run TestFastOpenRoundTrips` needs `tcp_fastopen=3` and netem on lo. With a
     warm cookie it expects 1 RTT for an L2 dial + write + echo, 1 for L1 and 2 for L0. `SOCKS0_NETEM_TC=1` adds
     the deferred-error tests.

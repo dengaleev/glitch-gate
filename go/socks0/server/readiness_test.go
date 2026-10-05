@@ -1,11 +1,11 @@
 package server_test
 
-// The L1/L2 readiness matrix of ../socks5-zero-rtt-bench, ported stdlib-only, plus extra cells.
+// The readiness matrix of ../socks5-zero-rtt-bench, ported, plus extra cells: early data sent with
+// the handshake, in any segmentation, reaches the target exactly once.
 
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -40,21 +40,6 @@ const splitCol = len(sizes)
 
 // probe, sent after the reply, tells lost early data from a hang.
 var probe = []byte("\x00post-reply probe\xff")
-
-// Non-repeating, so loss or reorder shows.
-var payload = sync.OnceValue(func() []byte {
-	b := make([]byte, 1<<20)
-	_, _ = rand.NewChaCha8([32]byte{'s', 'o', 'c', 'k', 's', '5'}).Read(b)
-	return b
-})
-
-var hasIPv6 = sync.OnceValue(func() bool {
-	ln, err := net.Listen("tcp", "[::1]:0")
-	if err == nil {
-		ln.Close()
-	}
-	return err == nil
-})
 
 type kase struct {
 	col        int
@@ -91,66 +76,6 @@ func matrix() []kase {
 	return ks
 }
 
-func s5Greeting(user string) []byte {
-	if user != "" {
-		return []byte{5, 1, 2}
-	}
-	return []byte{5, 1, 0}
-}
-
-func s5Auth(user, pass string) []byte {
-	b := append([]byte{1, byte(len(user))}, user...)
-	return append(append(b, byte(len(pass))), pass...)
-}
-
-func s5Connect(target string) ([]byte, error) {
-	host, portStr, err := net.SplitHostPort(target)
-	if err != nil {
-		return nil, err
-	}
-	port, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil {
-		return nil, err
-	}
-	b := []byte{5, 1, 0}
-	switch ip := net.ParseIP(host); {
-	case ip == nil:
-		b = append(append(b, 3, byte(len(host))), host...)
-	case ip.To4() != nil:
-		b = append(append(b, 1), ip.To4()...)
-	default:
-		b = append(append(b, 4), ip.To16()...)
-	}
-	return binary.BigEndian.AppendUint16(b, uint16(port)), nil
-}
-
-// s5ReadReplies reads nothing past the CONNECT reply.
-func s5ReadReplies(r io.Reader, user string) error {
-	var b [2]byte
-	if _, err := io.ReadFull(r, b[:]); err != nil {
-		return fmt.Errorf("read method selection: %w", err)
-	}
-	if want := s5Greeting(user)[2]; b != [2]byte{5, want} {
-		return fmt.Errorf("method selection %x, want 05%02x", b, want)
-	}
-	if user != "" {
-		if _, err := io.ReadFull(r, b[:]); err != nil {
-			return fmt.Errorf("read auth status: %w", err)
-		}
-		if b[1] != 0 {
-			return fmt.Errorf("auth rejected (status 0x%02x)", b[1])
-		}
-	}
-	rep, _, err := wire.ReadReply(r, wire.CmdConnect)
-	if err != nil {
-		return fmt.Errorf("read connect reply: %w", err)
-	}
-	if rep != wire.ReplySucceeded {
-		return fmt.Errorf("connect rejected (rep 0x%02x)", uint8(rep))
-	}
-	return nil
-}
-
 // message is greeting, [auth], CONNECT, early data, as one zero-RTT write.
 type message struct {
 	wire      []byte
@@ -159,15 +84,12 @@ type message struct {
 	fieldLens []int // every protocol field, in order
 }
 
-func newMessage(user, pass, target string, early []byte) (message, error) {
-	req, err := s5Connect(target)
-	if err != nil {
-		return message{}, err
-	}
-	parts := [][]byte{s5Greeting(user)}
+func newMessage(user, pass, target string, early []byte) message {
+	req := request(wire.CmdConnect, target)
+	parts := [][]byte{greeting(wire.MethodNoAuth)}
 	fields := []int{1, 1, 1}
 	if user != "" {
-		parts = append(parts, s5Auth(user, pass))
+		parts = [][]byte{greeting(wire.MethodUserPass), userPass(user, pass)}
 		fields = append(fields, 1, 1, len(user), 1, len(pass))
 	}
 	parts = append(parts, req)
@@ -192,7 +114,7 @@ func newMessage(user, pass, target string, early []byte) (message, error) {
 		m.partEnds = append(m.partEnds, end)
 	}
 	m.hsLen = len(m.wire) - len(early)
-	return m, nil
+	return m
 }
 
 func (m message) early() []byte { return m.wire[m.hsLen:] }
@@ -284,16 +206,12 @@ type rig struct {
 	noFIN     atomic.Bool
 }
 
-func newServer(user, pass string) *server.Server {
-	s := open()
-	if user != "" {
-		s.Auth = []server.Authenticator{server.UserPass{Users: map[string]string{user: pass}}}
-	}
-	return s
-}
-
-func startRig(s *server.Server, host string) (*rig, error) {
+// startRig serves s, or with serve another server, in front of an echo target on host.
+func startRig(s *server.Server, host string, serve func(net.Listener)) (*rig, error) {
 	r := &rig{srv: s}
+	if serve == nil {
+		serve = func(ln net.Listener) { _ = s.Serve(ln) }
+	}
 	lns, port, err := echoListeners(host)
 	if err != nil {
 		return nil, err
@@ -306,7 +224,7 @@ func startRig(s *server.Server, host string) (*rig, error) {
 		closeAll(lns)
 		return nil, err
 	}
-	r.wg.Go(func() { _ = s.Serve(proxyLn) })
+	r.wg.Go(func() { serve(proxyLn) })
 	r.proxy = proxyLn.Addr().String()
 	r.target = net.JoinHostPort(host, port)
 	r.listeners = append(lns, proxyLn)
@@ -320,12 +238,6 @@ func (r *rig) close() {
 	_ = r.srv.Shutdown(ctx)
 	r.srv.Close()
 	r.wg.Wait()
-}
-
-func closeAll(lns []net.Listener) {
-	for _, ln := range lns {
-		ln.Close()
-	}
 }
 
 // echo hangs up first, keeping TIME_WAIT off the server's ephemeral ports.
@@ -369,45 +281,14 @@ func closeRST(c net.Conn) {
 	c.Close()
 }
 
-// For localhost: 127.0.0.1 and ::1 at one port, whichever the server resolves.
-func echoListeners(host string) ([]net.Listener, string, error) {
-	ips := []string{host}
-	if host == "localhost" {
-		ips = []string{"127.0.0.1"}
-		if hasIPv6() {
-			ips = append(ips, "::1")
-		}
-	}
-	for range 100 {
-		var lns []net.Listener
-		port := "0"
-		for _, ip := range ips {
-			ln, err := net.Listen("tcp", net.JoinHostPort(ip, port))
-			if err != nil {
-				break
-			}
-			lns = append(lns, ln)
-			_, port, _ = net.SplitHostPort(ln.Addr().String())
-		}
-		if len(lns) == len(ips) {
-			return lns, port, nil
-		}
-		closeAll(lns)
-	}
-	return nil, "", fmt.Errorf("no common free port for %v", ips)
-}
-
 func (r *rig) run(ctx context.Context, k kase) error {
-	m, err := newMessage(k.user, k.pass, r.target, payload()[:k.size])
-	if err != nil {
-		return &failure{"setup", err}
-	}
+	m := newMessage(k.user, k.pass, r.target, payload()[:k.size])
 	segs := m.segments(splits[k.split].cuts(m))
 	got, err := r.exchange(ctx, k.user, segs, len(m.early())+len(probe))
 	if _, classified := errors.AsType[*failure](err); classified {
 		return err
 	}
-	return verify(m.early(), got, err)
+	return verdict(m.early(), got, err)
 }
 
 func (r *rig) exchange(ctx context.Context, user string, segs [][]byte, want int) (got []byte, err error) {
@@ -444,7 +325,7 @@ func (r *rig) exchange(ctx context.Context, user string, segs [][]byte, want int
 		}
 	})
 
-	if err := s5ReadReplies(c, user); err != nil {
+	if err := handshakeReplies(c, user); err != nil {
 		return nil, &failure{netReason(err, "reject"), err}
 	}
 	close(replied)
@@ -459,7 +340,8 @@ func (r *rig) exchange(ctx context.Context, user string, segs [][]byte, want int
 	return got, nil
 }
 
-func verify(early, got []byte, err error) error {
+// verdict classifies what came back for early, then the probe.
+func verdict(early, got []byte, err error) error {
 	want := slices.Concat(early, probe)
 	if bytes.Equal(got, want) {
 		return nil
@@ -492,7 +374,7 @@ func TestReadiness(t *testing.T) {
 		wg.Go(func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			r, err := startRig(newServer(k.user, k.pass), k.host)
+			r, err := startRig(newServer(k.user, k.pass), k.host, nil)
 			if err != nil {
 				errs[i] = &failure{"setup", err}
 				return
@@ -518,7 +400,7 @@ func TestReadiness(t *testing.T) {
 	}
 }
 
-// I6: a FIN arriving in the handshake read still comes after the early data.
+// A FIN arriving in the handshake read still comes after the early data.
 func TestReadinessCloseWrite(t *testing.T) {
 	for _, size := range []int{0, 1, 64, 1536, 64 << 10} {
 		for _, user := range []string{"", "user"} {
@@ -526,12 +408,12 @@ func TestReadinessCloseWrite(t *testing.T) {
 				s := newServer(user, "pass")
 				target := echoTCP(t, "127.0.0.1:0")
 				c := dial(t, serve(t, s))
-				m, _ := newMessage(user, "pass", target, payload()[:size])
+				m := newMessage(user, "pass", target, payload()[:size])
 				go func() {
 					_, _ = c.Write(m.wire)
 					_ = c.CloseWrite()
 				}()
-				if err := s5ReadReplies(c, user); err != nil {
+				if err := handshakeReplies(c, user); err != nil {
 					t.Fatal(err)
 				}
 				got, err := io.ReadAll(c)
@@ -547,13 +429,12 @@ func TestReadinessCloseWrite(t *testing.T) {
 func TestReadinessFlushBeforeRead(t *testing.T) {
 	target := echoTCP(t, "127.0.0.1:0")
 	c := dial(t, serve(t, newServer("user", "pass")))
-	if _, err := c.Write(cat(s5Greeting("user"), s5Auth("user", "pass"))); err != nil {
+	if _, err := c.Write(cat(greeting(wire.MethodUserPass), userPass("user", "pass"))); err != nil {
 		t.Fatal(err)
 	}
 	expect(t, c, []byte{5, 2, 1, 0})
-	req, _ := s5Connect(target)
 	time.Sleep(segGap)
-	if _, err := c.Write(cat(req, []byte("early"))); err != nil {
+	if _, err := c.Write(cat(request(wire.CmdConnect, target), []byte("early"))); err != nil {
 		t.Fatal(err)
 	}
 	if rep, _ := readReply(t, c, wire.CmdConnect); rep != 0 {
@@ -562,22 +443,18 @@ func TestReadinessFlushBeforeRead(t *testing.T) {
 	expect(t, c, []byte("early"))
 }
 
-// slowDial: no client read during the dial, and no deadlock under flow control.
-func slowDial(d time.Duration) *server.ConnectHandler {
-	return &server.ConnectHandler{Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
-		time.Sleep(d)
-		return new(net.Dialer).DialContext(ctx, network, addr)
-	}}
-}
-
+// No client read during a slow dial, and no deadlock under flow control; the selection goes ahead.
 func TestReadinessSlowDial(t *testing.T) {
 	for _, size := range []int{64 << 10, 1 << 20} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
 			target := echoTCP(t, "127.0.0.1:0")
 			s := open()
-			s.Handler = slowDial(200 * time.Millisecond)
+			s.Handler = &server.ConnectHandler{Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				time.Sleep(200 * time.Millisecond)
+				return new(net.Dialer).DialContext(ctx, network, addr)
+			}}
 			c := dial(t, serve(t, s))
-			m, _ := newMessage("", "", target, payload()[:size])
+			m := newMessage("", "", target, payload()[:size])
 			var wg sync.WaitGroup
 			defer wg.Wait()
 			start := time.Now()
@@ -587,7 +464,7 @@ func TestReadinessSlowDial(t *testing.T) {
 			})
 			expect(t, c, []byte{5, 0})
 			if d := time.Since(start); d > 150*time.Millisecond {
-				t.Errorf("method selection after %v: not ahead of the slow dial (I7)", d)
+				t.Errorf("method selection after %v: not ahead of the slow dial", d)
 			}
 			if rep, _ := readReply(t, c, wire.CmdConnect); rep != 0 {
 				t.Fatal(rep)
@@ -602,11 +479,7 @@ func TestReadinessSlowDial(t *testing.T) {
 
 // The target speaks first (SMTP, SSH banners).
 func TestReadinessTargetFirst(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
+	ln := listenLoopback(t)
 	go func() {
 		c, err := ln.Accept()
 		if err != nil {
@@ -617,11 +490,10 @@ func TestReadinessTargetFirst(t *testing.T) {
 		_, _ = io.Copy(c, c)
 	}()
 	c := dial(t, serve(t, open()))
-	m, _ := newMessage("", "", ln.Addr().String(), nil)
-	if _, err := c.Write(m.wire); err != nil {
+	if _, err := c.Write(newMessage("", "", ln.Addr().String(), nil).wire); err != nil {
 		t.Fatal(err)
 	}
-	if err := s5ReadReplies(c, ""); err != nil {
+	if err := handshakeReplies(c, ""); err != nil {
 		t.Fatal(err)
 	}
 	expect(t, c, []byte("220 banner\r\n"))
@@ -629,54 +501,22 @@ func TestReadinessTargetFirst(t *testing.T) {
 	expect(t, c, []byte("EHLO\r\n"))
 }
 
-type writeCounter struct {
-	net.Listener
-	writes chan *countConn
-}
-
-type countConn struct {
-	net.Conn
-	n atomic.Int32
-}
-
-func (c *countConn) Write(b []byte) (int, error) {
-	c.n.Add(1)
-	return c.Conn.Write(b)
-}
-
-func (l *writeCounter) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	cc := &countConn{Conn: c}
-	l.writes <- cc
-	return cc, nil
-}
-
-// I7: a pipelined client gets at most two server writes before the relay.
+// A pipelined client gets at most two server writes before the relay.
 func TestReadinessSegments(t *testing.T) {
 	for _, user := range []string{"", "user"} {
 		t.Run("auth="+user, func(t *testing.T) {
 			target := echoTCP(t, "127.0.0.1:0")
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			wc := &writeCounter{Listener: ln, writes: make(chan *countConn, 1)}
+			ln := spyListener{listenLoopback(t), make(chan *spyConn, 1)}
 			s := newServer(user, "pass")
 			s.Handler = server.HandlerFunc(func(ctx context.Context, r *server.Request) error {
 				return (&server.ConnectHandler{Filter: server.AllowAll}).ServeSOCKS(ctx, r)
 			})
-			go func() { _ = s.Serve(wc) }()
-			defer s.Close()
-			c := dial(t, ln.Addr().String())
-			m, _ := newMessage(user, "pass", target, nil)
-			_, _ = c.Write(m.wire)
-			if err := s5ReadReplies(c, user); err != nil {
+			c := dial(t, serveLn(t, s, ln))
+			_, _ = c.Write(newMessage(user, "pass", target, nil).wire)
+			if err := handshakeReplies(c, user); err != nil {
 				t.Fatal(err)
 			}
-			if n := (<-wc.writes).n.Load(); n > 2 {
+			if n := (<-ln.spies).writes.Load(); n > 2 {
 				t.Errorf("%d server writes before the relay, want ≤ 2", n)
 			}
 		})

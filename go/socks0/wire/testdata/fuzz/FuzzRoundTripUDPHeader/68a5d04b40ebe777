@@ -1,6 +1,0 @@
-go test fuzz v1
-byte('\x1c')
-byte('F')
-[]byte("0")
-string("000000000000")
-uint16(0)

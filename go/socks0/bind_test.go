@@ -9,7 +9,9 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,86 +20,15 @@ import (
 	"github.com/dengaleev/glitch-gate/go/socks0/wire"
 )
 
-// bindProxy serves BIND: one peer on loopback, two replies, then relays.
-type bindProxy struct {
-	bnd        func(ln netip.AddrPort) wire.Addr // BND of reply 1; nil: the listener's address
-	rep1, rep2 wire.Reply
-	eof        bool           // close instead of reply 2, once the peer connected
-	peerFirst  int            // bytes the peer sends to read before reply 2, sent with it in one write
-	got        chan wire.Addr // receives DST, if not nil
-}
-
-func (p bindProxy) serve(c net.Conn) {
-	if _, err := wire.ReadGreeting(c); err != nil {
-		return
-	}
-	c.Write(wire.AppendMethodSelection(nil, wire.MethodNoAuth))
-	cmd, dst, err := wire.ReadRequest(c)
-	if err != nil || cmd != wire.CmdBind {
-		return
-	}
-	if p.got != nil {
-		p.got <- dst
-	}
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		return
-	}
-	defer ln.Close()
-	bnd := wire.AddrFromAddrPort(ln.Addr().(*net.TCPAddr).AddrPort())
-	if p.bnd != nil {
-		bnd = p.bnd(ln.Addr().(*net.TCPAddr).AddrPort())
-	}
-	b, _ := wire.AppendReply(nil, p.rep1, bnd)
-	c.Write(b)
-	if p.rep1 != 0 {
-		return
-	}
-	ln.(*net.TCPListener).SetDeadline(time.Now().Add(300 * time.Millisecond)) // the client may give up
-	peer, err := ln.Accept()
-	if err != nil {
-		return
-	}
-	defer peer.Close()
-	if p.eof {
-		return
-	}
-	first := make([]byte, p.peerFirst)
-	if _, err := io.ReadFull(peer, first); err != nil {
-		return
-	}
-	b, _ = wire.AppendReply(nil, p.rep2, wire.AddrFromAddrPort(peer.RemoteAddr().(*net.TCPAddr).AddrPort()))
-	c.Write(append(b, first...))
-	if p.rep2 != 0 {
-		return
-	}
-	go func() { io.Copy(peer, c); peer.(*net.TCPConn).CloseWrite() }()
-	io.Copy(c, peer)
-}
-
 func TestListen(t *testing.T) {
 	for _, mode := range modes {
 		for _, peerFirst := range []int{0, 5} {
 			t.Run(fmt.Sprintf("%v/coalesced=%v", mode, peerFirst > 0), func(t *testing.T) {
 				got := make(chan wire.Addr, 1)
 				conns := make(chan *recConn, 1)
-				var events []string
-				var mu sync.Mutex
-				ev := func(s string) { mu.Lock(); events = append(events, s); mu.Unlock() }
-				d := &socks0.Dialer{
-					ProxyAddr: listen(t, bindProxy{got: got, peerFirst: peerFirst}.serve),
-					ProxyDial: recDial(conns),
-					Config: &socks0.Config{Mode: mode, Trace: &socks0.ClientTrace{
-						GotReply:      func(rep wire.Reply, bound wire.Addr) { ev("reply") },
-						HandshakeDone: func(err error) { ev(fmt.Sprint("done ", err)) },
-						Accepted:      func(peer wire.Addr, err error) { ev(fmt.Sprint("accepted ", err)) },
-					}},
-				}
-				ln, err := d.Listen(t.Context(), "tcp", "192.0.2.5:0")
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer ln.Close()
+				var ev events
+				d := &socks0.Dialer{ProxyAddr: listen(t, bindProxy{got: got, peerFirst: peerFirst}.serve), ProxyDial: recDial(conns), Config: &socks0.Config{Mode: mode, Trace: ev.trace("t")}}
+				ln := mustListen(t, d, "192.0.2.5:0")
 				if dst := <-got; dst != mustAddr("192.0.2.5:0") {
 					t.Errorf("DST %v", dst)
 				}
@@ -127,20 +58,17 @@ func TestListen(t *testing.T) {
 					t.Errorf("LocalAddr %v", c.LocalAddr())
 				}
 				if peerFirst > 0 {
-					buf := make([]byte, 5)
-					if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "early" {
-						t.Fatalf("peer's first bytes %q, %v", buf, err)
+					if s := readN(t, c, 5); s != "early" {
+						t.Fatalf("peer's first bytes %q", s)
 					}
 				}
 				c.Write([]byte("to peer"))
-				buf := make([]byte, 7)
-				if _, err := io.ReadFull(peer, buf); err != nil || string(buf) != "to peer" {
-					t.Fatalf("peer read %q, %v", buf, err)
+				if s := readN(t, peer, 7); s != "to peer" {
+					t.Fatalf("peer read %q", s)
 				}
 				peer.Write([]byte("from peer"))
-				buf = make([]byte, 9)
-				if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "from peer" {
-					t.Fatalf("read %q, %v", buf, err)
+				if s := readN(t, c, 9); s != "from peer" {
+					t.Fatalf("read %q", s)
 				}
 				if err := sc.CloseWrite(); err != nil {
 					t.Error(err)
@@ -154,13 +82,12 @@ func TestListen(t *testing.T) {
 				if _, err := io.ReadAll(peer); err != nil {
 					t.Errorf("accepted conn did not survive Close: %v", err)
 				}
-				mu.Lock()
-				defer mu.Unlock()
-				if want := []string{"reply", "done <nil>", "accepted <nil>"}; !slices.Equal(events, want) {
-					t.Errorf("trace %q, want %q", events, want)
+				want := []string{"ConnectStart", "ConnectDone ok", "WroteHandshake ok", "GotMethod no auth", "GotReply succeeded " + sl.BoundAddr().String(),
+					"HandshakeDone ok", "Accepted " + peer.LocalAddr().String() + " ok"}
+				if got := only(ev.get(), "t"); !slices.Equal(got, want) {
+					t.Errorf("trace %q, want %q", got, want)
 				}
-				writes, _, _ := (<-conns).snapshot()
-				if mode != socks0.ModeSequential && len(writes) != 2 { // the handshake, then "to peer"
+				if writes, _ := (<-conns).snapshot(); mode != socks0.ModeSequential && len(writes) != 2 { // the handshake, then "to peer"
 					t.Errorf("%d writes", len(writes))
 				}
 			})
@@ -168,10 +95,43 @@ func TestListen(t *testing.T) {
 	}
 }
 
-func TestListenAddr(t *testing.T) {
-	unspec := func(ap netip.AddrPort) wire.Addr {
-		return wire.AddrFromAddrPort(netip.AddrPortFrom(netip.IPv4Unspecified(), ap.Port()))
+// Listen leaves reply 2 and the peer's data unread when they come with reply 1.
+func TestListenRepliesCoalesced(t *testing.T) {
+	for _, mode := range modes {
+		t.Run(mode.String(), func(t *testing.T) {
+			var ev events
+			addr := listen(t, bind5(func(c net.Conn) {
+				c.Write(slices.Concat(reply(0, "0.0.0.0:5555"), reply(0, "[2001:db8::7]:4444"), []byte("peer-data")))
+				io.Copy(io.Discard, c)
+			}))
+			d := &socks0.Dialer{ProxyAddr: addr, Config: &socks0.Config{Mode: mode, Trace: ev.trace("t")}}
+			ln := mustListen(t, d, "")
+			l := ln.(*socks0.Listener)
+			if a, ok := l.Addr().(*net.TCPAddr); !ok || a.String() != "127.0.0.1:5555" || l.BoundAddr().String() != "0.0.0.0:5555" {
+				t.Errorf("Addr = %#v, BoundAddr = %v", l.Addr(), l.BoundAddr())
+			}
+			time.Sleep(20 * time.Millisecond)
+			c, err := ln.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			if c.RemoteAddr().String() != "[2001:db8::7]:4444" || c.LocalAddr().String() != "127.0.0.1:5555" || c.(*socks0.Conn).BoundAddr().String() != "[2001:db8::7]:4444" {
+				t.Errorf("addrs %v %v", c.LocalAddr(), c.RemoteAddr())
+			}
+			c.SetReadDeadline(time.Now().Add(time.Second))
+			if s := readN(t, c, len("peer-data")); s != "peer-data" {
+				t.Errorf("Read = %q", s)
+			}
+			want := []string{"ConnectStart", "ConnectDone ok", "WroteHandshake ok", "GotMethod no auth", "GotReply succeeded 0.0.0.0:5555", "HandshakeDone ok", "Accepted [2001:db8::7]:4444 ok"}
+			if got := only(ev.get(), "t"); !slices.Equal(got, want) {
+				t.Errorf("trace %q, want %q", got, want)
+			}
+		})
 	}
+}
+
+func TestListenAddr(t *testing.T) {
 	named := func(ap netip.AddrPort) wire.Addr { return mustAddr(fmt.Sprintf("proxy.example:%d", ap.Port())) }
 	for _, tt := range []struct {
 		name    string
@@ -181,20 +141,15 @@ func TestListenAddr(t *testing.T) {
 		host    string // ProxyAddr host
 		want    string // Addr's type and host
 	}{
-		{name: "unspecified", bnd: unspec, address: "", dst: "0.0.0.0:0", want: "*net.TCPAddr 127.0.0.1"},
-		{name: "unspecified named proxy", bnd: unspec, host: "localhost", dst: "198.51.100.1:21", address: "198.51.100.1:21", want: "*net.TCPAddr 127.0.0.1"},
+		{name: "unspecified", bnd: unspec4, address: "", dst: "0.0.0.0:0", want: "*net.TCPAddr 127.0.0.1"},
+		{name: "unspecified named proxy", bnd: unspec4, host: "localhost", dst: "198.51.100.1:21", address: "198.51.100.1:21", want: "*net.TCPAddr 127.0.0.1"},
 		{name: "name", bnd: named, address: "0.0.0.0:0", dst: "0.0.0.0:0", want: "wire.Addr proxy.example"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got := make(chan wire.Addr, 1)
-			addr := listen(t, bindProxy{bnd: tt.bnd, got: got}.serve)
-			_, port, _ := net.SplitHostPort(addr)
+			_, port, _ := net.SplitHostPort(listen(t, bindProxy{bnd: tt.bnd, got: got}.serve))
 			d := &socks0.Dialer{ProxyAddr: net.JoinHostPort(cmp.Or(tt.host, "127.0.0.1"), port)}
-			ln, err := d.Listen(t.Context(), "tcp", tt.address)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer ln.Close()
+			ln := mustListen(t, d, tt.address)
 			if dst := <-got; dst != mustAddr(tt.dst) {
 				t.Errorf("DST %v", dst)
 			}
@@ -220,8 +175,7 @@ func TestListenErrors(t *testing.T) {
 		{name: "port 0", p: bindProxy{bnd: zero}, stage: wire.StageReply, kind: socks0.KindProtocol},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			d := &socks0.Dialer{ProxyAddr: listen(t, tt.p.serve)}
-			ln, err := d.Listen(t.Context(), "tcp", "")
+			ln, err := (&socks0.Dialer{ProxyAddr: listen(t, tt.p.serve)}).Listen(t.Context(), "tcp", "")
 			if ln != nil {
 				t.Fatalf("ln = %v", ln)
 			}
@@ -232,13 +186,13 @@ func TestListenErrors(t *testing.T) {
 		})
 	}
 	for _, tt := range []struct{ network, address string }{{"udp", ""}, {"tcp6", "192.0.2.1:0"}, {"tcp", "nope"}} {
-		_, err := (&socks0.Dialer{ProxyAddr: "127.0.0.1:1"}).Listen(t.Context(), tt.network, tt.address)
-		if socks0.KindOf(err) != socks0.KindConfig {
+		if _, err := (&socks0.Dialer{ProxyAddr: "127.0.0.1:1"}).Listen(t.Context(), tt.network, tt.address); socks0.KindOf(err) != socks0.KindConfig {
 			t.Errorf("Listen(%q, %q) = %v", tt.network, tt.address, err)
 		}
 	}
 }
 
+// A failed reply 2 fails the one Accept, then the Listener is done.
 func TestAcceptErrors(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -249,55 +203,53 @@ func TestAcceptErrors(t *testing.T) {
 		{name: "reply 2", p: bindProxy{rep2: wire.ReplyConnectionRefused}, kind: socks0.KindReply, is: eConnRefused},
 		{name: "EOF", p: bindProxy{eof: true}, kind: socks0.KindEOF, is: io.ErrUnexpectedEOF},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			var accepted []error
-			d := &socks0.Dialer{ProxyAddr: listen(t, tt.p.serve), Config: &socks0.Config{Trace: &socks0.ClientTrace{
-				Accepted: func(_ wire.Addr, err error) { accepted = append(accepted, err) },
-			}}}
-			ln, err := d.Listen(t.Context(), "tcp", "")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer ln.Close()
-			peer, err := net.Dial("tcp", ln.Addr().String())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer peer.Close()
-			c, err := ln.Accept()
-			if c != nil {
-				t.Fatal("conn")
-			}
-			he := handshakeErrOf(t, err)
-			if err.(*net.OpError).Op != "socks bind" || he.Stage != socks0.StageAccept || socks0.KindOf(err) != tt.kind || tt.is != nil && !errors.Is(err, tt.is) {
-				t.Errorf("err = %v; stage %q, kind %q", err, he.Stage, socks0.KindOf(err))
-			}
-			if pe, ok := errors.AsType[*socks0.ProtocolError](err); ok && pe.Stage != wire.StageReply {
-				t.Errorf("ProtocolError stage %q", pe.Stage)
-			}
-			if len(accepted) != 1 || accepted[0] != err {
-				t.Errorf("Accepted hook got %v", accepted)
-			}
-			if _, err := ln.Accept(); !errors.Is(err, net.ErrClosed) {
-				t.Errorf("second Accept: %v", err)
-			}
-		})
+		for _, mode := range modes {
+			t.Run(tt.name+"/"+mode.String(), func(t *testing.T) {
+				var ev events
+				d := &socks0.Dialer{ProxyAddr: listen(t, tt.p.serve), Config: &socks0.Config{Mode: mode, Trace: ev.trace("t")}}
+				ln := mustListen(t, d, "")
+				netDial(t, "tcp", ln.Addr().String())
+				c, err := ln.Accept()
+				if c != nil {
+					t.Fatal("conn")
+				}
+				he := handshakeErrOf(t, err)
+				if err.(*net.OpError).Op != "socks bind" || he.Stage != socks0.StageAccept || socks0.KindOf(err) != tt.kind || tt.is != nil && !errors.Is(err, tt.is) {
+					t.Errorf("err = %v; stage %q, kind %q", err, he.Stage, socks0.KindOf(err))
+				}
+				if pe, ok := errors.AsType[*socks0.ProtocolError](err); ok && pe.Stage != wire.StageReply {
+					t.Errorf("ProtocolError stage %q", pe.Stage)
+				}
+				var replies, accepted []string
+				for _, e := range only(ev.get(), "t") {
+					if s, ok := strings.CutPrefix(e, "Accepted "); ok {
+						accepted = append(accepted, s)
+					} else if strings.HasPrefix(e, "GotReply ") {
+						replies = append(replies, e)
+					}
+				}
+				if len(replies) != 1 || len(accepted) != 1 || !strings.HasSuffix(accepted[0], " err") {
+					t.Errorf("trace: replies %q, accepted %q", replies, accepted)
+				}
+				if _, err := ln.Accept(); !errors.Is(err, net.ErrClosed) {
+					t.Errorf("second Accept: %v", err)
+				}
+				if err := ln.Close(); err != nil {
+					t.Errorf("Close after a failed Accept = %v", err)
+				}
+			})
+		}
 	}
 }
 
 func TestListenerClose(t *testing.T) {
-	d := &socks0.Dialer{ProxyAddr: listen(t, bindProxy{}.serve)}
-	ln, err := d.Listen(t.Context(), "tcp", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	var ev events
+	d := &socks0.Dialer{ProxyAddr: listen(t, bindProxy{}.serve), Config: &socks0.Config{Trace: ev.trace("t")}}
+	ln := mustListen(t, d, "")
 	var wg sync.WaitGroup
 	errs := make(chan error, 3)
 	for range 3 {
-		wg.Go(func() {
-			_, err := ln.Accept()
-			errs <- err
-		})
+		wg.Go(func() { _, err := ln.Accept(); errs <- err })
 	}
 	time.Sleep(20 * time.Millisecond)
 	if err := ln.Close(); err != nil {
@@ -316,11 +268,13 @@ func TestListenerClose(t *testing.T) {
 	if err := ln.(*socks0.Listener).SetDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
 		t.Errorf("SetDeadline after Close: %v", err)
 	}
+	if n := len(slices.DeleteFunc(only(ev.get(), "t"), func(s string) bool { return !strings.HasPrefix(s, "Accepted") })); n != 1 {
+		t.Errorf("Accepted ran %d times", n)
+	}
 }
 
 func TestListenerDeadline(t *testing.T) {
-	d := &socks0.Dialer{ProxyAddr: listen(t, bindProxy{}.serve)}
-	ln, err := d.Listen(t.Context(), "tcp", "")
+	ln, err := (&socks0.Dialer{ProxyAddr: listen(t, bindProxy{}.serve)}).Listen(t.Context(), "tcp", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,39 +283,67 @@ func TestListenerDeadline(t *testing.T) {
 	if err := sl.SetDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
+	start := time.Now()
 	_, err = ln.Accept()
-	if !errors.Is(err, os.ErrDeadlineExceeded) || socks0.KindOf(err) != socks0.KindTimeout || handshakeErrOf(t, err).Stage != socks0.StageAccept {
+	if !errors.Is(err, os.ErrDeadlineExceeded) || socks0.KindOf(err) != socks0.KindTimeout || handshakeErrOf(t, err).Stage != socks0.StageAccept || time.Since(start) > time.Second {
 		t.Errorf("Accept = %v", err)
 	}
-	if !err.(*net.OpError).Timeout() {
+	if !err.(net.Error).Timeout() {
 		t.Error("Timeout() = false")
+	}
+	if err := sl.SetDeadline(time.Time{}); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("SetDeadline after Accept = %v", err)
 	}
 }
 
-func TestRequestBind(t *testing.T) {
-	addr := listen(t, bindProxy{peerFirst: 3}.serve)
-	conn, err := net.Dial("tcp", addr)
+// Listen's ctx bounds Listen, not Accept.
+func TestListenContext(t *testing.T) {
+	release := make(chan struct{})
+	d := &socks0.Dialer{ProxyAddr: listen(t, bind5(func(c net.Conn) {
+		c.Write(reply(0, "127.0.0.1:5555"))
+		<-release
+		c.Write(append(reply(0, "192.0.2.9:1"), "hi"...))
+		io.Copy(io.Discard, c)
+	}))}
+	ctx, cancel := context.WithCancel(t.Context())
+	ln, err := d.Listen(ctx, "tcp", "192.0.2.9:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	c, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("Accept after ctx cancel = %v", err)
+	}
+	c.Close()
+
+	d = &socks0.Dialer{ProxyAddr: listen(t, bind5(func(c net.Conn) { io.Copy(io.Discard, c) }))}
+	base := runtime.NumGoroutine()
+	ctx, cancel = context.WithCancel(t.Context())
+	time.AfterFunc(30*time.Millisecond, cancel)
+	_, err = d.Listen(ctx, "tcp", "192.0.2.9:0")
+	if !errors.Is(err, context.Canceled) || socks0.KindOf(err) != socks0.KindCanceled || handshakeErrOf(t, err).Stage != wire.StageReply {
+		t.Fatalf("Listen = %v (%q)", err, socks0.KindOf(err))
+	}
+	waitGoroutines(t, base+1)
+}
+
+func TestRequestBind(t *testing.T) {
+	conn := netDial(t, "tcp", listen(t, bindProxy{peerFirst: 3}.serve))
 	bound, err := socks0.Request(t.Context(), conn, wire.CmdBind, mustAddr("0.0.0.0:0"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	peer, err := net.Dial("tcp", bound.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peer.Close()
+	peer := netDial(t, "tcp", bound.String())
 	peer.Write([]byte("abc"))
 	rep, who, err := wire.ReadReply(conn, wire.CmdBind)
 	if err != nil || rep != 0 || who.String() != peer.LocalAddr().String() {
 		t.Fatalf("reply 2: %v, %v, %v", rep, who, err)
 	}
-	buf := make([]byte, 3)
-	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "abc" {
-		t.Fatalf("read %q, %v", buf, err)
+	if s := readN(t, conn, 3); s != "abc" {
+		t.Fatalf("read %q", s)
 	}
 	if _, err := socks0.Request(t.Context(), nil, wire.CmdConnect, mustAddr("0.0.0.0:0"), nil); socks0.KindOf(err) != socks0.KindConfig {
 		t.Errorf("nil conn: %v", err)
@@ -375,11 +357,7 @@ func TestListenerConcurrentAccept(t *testing.T) {
 	d := &socks0.Dialer{ProxyAddr: "proxy", ProxyDial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return new(net.Dialer).DialContext(ctx, network, addr)
 	}}
-	ln, err := d.Listen(t.Context(), "tcp", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
+	ln := mustListen(t, d, "")
 	sl := ln.(*socks0.Listener)
 	accepted := make(chan net.Conn, 1)
 	stop := make(chan struct{})
@@ -405,11 +383,7 @@ func TestListenerConcurrentAccept(t *testing.T) {
 			}
 		})
 	}
-	peer, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peer.Close()
+	netDial(t, "tcp", ln.Addr().String())
 	var c net.Conn
 	select {
 	case c = <-accepted:
